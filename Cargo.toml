@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["crates/archpkg", "apps/gui", "apps/tray"]
+# `cargo run` at the workspace root starts the GUI; the tray is `cargo run -p fuide-arch-update-tray`
+default-members = ["apps/gui"]
 
 [workspace.package]
 edition = "2021"
