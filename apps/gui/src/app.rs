@@ -191,6 +191,9 @@ pub struct PkgApp {
     /// Names whose `-Si` details were requested (search results).
     details_requested: std::collections::HashSet<String>,
     start: StartUp,
+    /// Lock + socket of the one instance per session (`instance.rs`); requests from later
+    /// launches arrive here.
+    instance: Option<crate::instance::Guard>,
     devshot: fuide::devshot::DevShot,
     agent: fuide::Agent,
     dev_dialog: Option<String>,
@@ -205,11 +208,17 @@ pub struct PkgApp {
 }
 
 impl PkgApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, start: StartUp) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        start: StartUp,
+        mut instance: crate::instance::Guard,
+    ) -> Self {
         let settings = Settings::load(APP_ID).unwrap_or_else(|| Settings::new(PaletteKind::Cyan));
         let mut app = Self::with_context(&cc.egui_ctx, settings);
         app.settings_path = Settings::path(APP_ID);
         app.start = start;
+        instance.serve(cc.egui_ctx.clone());
+        app.instance = Some(instance);
         app.load_saved_check();
         app.backend.fetch_inventory(cc.egui_ctx.clone());
         app.backend.fetch_system(cc.egui_ctx.clone());
@@ -241,6 +250,7 @@ impl PkgApp {
             fetch_ms: 0.0,
             details_requested: Default::default(),
             start: StartUp::default(),
+            instance: None,
             devshot: fuide::devshot::DevShot::from_env(),
             agent: fuide::Agent::new(APP_ID, APP_NAME),
             dev_dialog: std::env::var("FUIDE_DEV_DIALOG").ok(),
@@ -590,6 +600,35 @@ impl PkgApp {
                 }
             }
         }
+    }
+
+    /// Requests from later launches (the tray's click while the window is open): apply them
+    /// like start-up flags and bring the window to the front.
+    fn poll_instance(&mut self, ctx: &egui::Context) {
+        let requests = match self.instance.as_mut() {
+            Some(g) => g.drain(),
+            None => return,
+        };
+        if requests.is_empty() {
+            return;
+        }
+        for r in requests {
+            match r {
+                crate::instance::Request::Show => {}
+                crate::instance::Request::Upgrade => self.start.upgrade = true,
+                crate::instance::Request::Select(name) => self.start.select = Some(name),
+            }
+        }
+        // a request that needs the inventory waits for it when it is not in yet (see `poll`);
+        // a full-upgrade request never interrupts a running command or an open dialog
+        if !self.packages.is_empty() {
+            if self.start.upgrade && (self.dialog.is_some() || self.backend.running().is_some()) {
+                self.start.upgrade = false;
+            }
+            self.after_inventory();
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 
     /// Start-up requests that need the inventory: `--select`, `--upgrade`.
@@ -1065,6 +1104,7 @@ impl eframe::App for PkgApp {
         self.agent.tick(ui.ctx(), agent_state);
         let t = ui.input(|i| i.time);
         let ctx = ui.ctx().clone();
+        self.poll_instance(&ctx);
         self.poll(&ctx, t);
         if self.dirty {
             self.rebuild_rows();
