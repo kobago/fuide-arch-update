@@ -1,0 +1,44 @@
+# Maintainer: Go Kobayashi <kobago55555@gmail.com>
+# The `fuide` crate is fetched over ssh from a private repository, so build on a machine whose
+# ssh agent can read github.com/kobago/fuide (not in a clean chroot):
+#
+#   cd pkg && makepkg -si
+pkgname=fuide-arch-update-git
+pkgver=r0
+pkgrel=1
+pkgdesc="Package manager for Arch Linux (pacman + AUR helper) with a Sci-Fi FUI look, plus a systray update checker"
+arch=('x86_64')
+url="https://github.com/kobago/fuide-arch-update"
+license=('GPL-3.0-or-later')
+depends=('pacman' 'pacman-contrib' 'sudo' 'fontconfig' 'hicolor-icon-theme')
+makedepends=('git' 'cargo' 'openssh')
+optdepends=('yay: AUR support' 'paru: AUR support' 'noto-fonts-cjk: Japanese text')
+provides=('fuide-arch-update')
+conflicts=('fuide-arch-update')
+source=("${pkgname}::git+https://github.com/kobago/fuide-arch-update.git")
+sha256sums=('SKIP')
+
+pkgver() {
+	cd "${pkgname}"
+	printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+	cd "${pkgname}"
+	cargo fetch --locked
+}
+
+build() {
+	cd "${pkgname}"
+	cargo build --release --frozen
+}
+
+check() {
+	cd "${pkgname}"
+	cargo test --release --frozen -p archpkg
+}
+
+package() {
+	cd "${pkgname}"
+	make DESTDIR="${pkgdir}" PREFIX=/usr install
+}

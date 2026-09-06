@@ -1,0 +1,24 @@
+# The `fuide` crate is fetched over ssh from a private repository: add a read-only deploy key
+# for github.com/kobago/fuide as the FUIDE_DEPLOY_KEY secret.
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up ssh for the fuide dependency
+        env:
+          FUIDE_DEPLOY_KEY: ${{ secrets.FUIDE_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${FUIDE_DEPLOY_KEY}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test

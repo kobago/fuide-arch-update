@@ -1,0 +1,113 @@
+Installed From  : cachyos-v3
+Name            : bash
+Version         : 5.3.15-2
+Description     : The GNU Bourne Again shell
+Architecture    : x86_64_v3
+URL             : https://www.gnu.org/software/bash/bash.html
+Licenses        : GPL-3.0-or-later
+Groups          : None
+Provides        : sh
+Depends On      : readline  libreadline.so=8-64  glibc  ncurses
+Optional Deps   : bash-completion: for tab completion [installed]
+Required By     : alsa-utils  base  pacman
+Optional For    : mdadm
+Conflicts With  : None
+Replaces        : None
+Installed Size  : 9.68 MiB
+Packager        : CachyOS <admin@cachyos.org>
+Build Date      : Mon Jun 29 01:28:21 2026
+Install Date    : Mon Jun 29 17:15:09 2026
+Install Reason  : Installed as a dependency for another package
+Install Script  : Yes
+Validated By    : Signature
+
+Installed From  : extra
+Name            : ripgrep
+Version         : 15.2.0-1
+Description     : A search tool that combines the usability of ag with the raw speed of grep
+Architecture    : x86_64
+URL             : https://github.com/BurntSushi/ripgrep
+Licenses        : MIT OR Unlicense
+Groups          : None
+Provides        : None
+Depends On      : glibc  libgcc  pcre2
+Optional Deps   : None
+Required By     : None
+Optional For    : None
+Conflicts With  : None
+Replaces        : None
+Installed Size  : 3.57 MiB
+Packager        : Arch Linux
+Build Date      : Sun Jul 19 01:35:35 2026
+Install Date    : Sun Jul 19 10:00:00 2026
+Install Reason  : Explicitly installed
+Install Script  : No
+Validated By    : Signature
+
+Name            : yay
+Version         : 13.0.0-1
+Description     : Yet another yogurt. Pacman wrapper and AUR helper written in go.
+Architecture    : x86_64
+URL             : https://github.com/Jguer/yay
+Licenses        : GPL-3.0-or-later
+Groups          : None
+Provides        : None
+Depends On      : pacman  git
+Optional Deps   : sudo: privilege elevation [installed]
+Required By     : None
+Optional For    : None
+Conflicts With  : None
+Replaces        : None
+Installed Size  : 8.00 MiB
+Packager        : Unknown Packager
+Build Date      : Mon Aug 10 12:00:00 2026
+Install Date    : Mon Aug 10 12:05:00 2026
+Install Reason  : Explicitly installed
+Install Script  : No
+Validated By    : None
+
+Name            : visual-studio-code-bin
+Version         : 1.136.0-1
+Description     : Visual Studio Code (vscode): Editor for building and debugging modern web and cloud applications (official binary version)
+Architecture    : x86_64
+URL             : https://code.visualstudio.com/
+Licenses        : custom: commercial
+Groups          : None
+Provides        : code  vscode
+Depends On      : libxkbfile  gnupg  gtk3  libsecret  nss
+Optional Deps   : glib2: GSettings
+Required By     : None
+Optional For    : None
+Conflicts With  : code
+Replaces        : None
+Installed Size  : 380.00 MiB
+Packager        : Unknown Packager
+Build Date      : Fri Sep 04 00:00:00 2026
+Install Date    : Fri Sep 04 00:10:00 2026
+Install Reason  : Explicitly installed
+Install Script  : No
+Validated By    : None
+
+Installed From  : extra
+Name            : orphan-lib
+Version         : 2.0-1
+Description     : A library nothing needs any more
+Architecture    : x86_64
+URL             : https://example.org/orphan-lib
+Licenses        : MIT
+Groups          : None
+Provides        : None
+Depends On      : glibc
+Optional Deps   : None
+Required By     : None
+Optional For    : None
+Conflicts With  : None
+Replaces        : None
+Installed Size  : 1.00 MiB
+Packager        : Arch Linux
+Build Date      : Mon Jun 01 00:00:00 2026
+Install Date    : Mon Jun 01 00:00:00 2026
+Install Reason  : Installed as a dependency for another package
+Install Script  : No
+Validated By    : Signature
+

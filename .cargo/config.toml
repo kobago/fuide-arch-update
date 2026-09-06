@@ -1,0 +1,4 @@
+# The `fuide` crate lives in a private repository reached over ssh: let cargo use the system
+# `git` (ssh agent, ~/.ssh/config) instead of libgit2.
+[net]
+git-fetch-with-cli = true

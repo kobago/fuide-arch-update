@@ -1,0 +1,5 @@
+/target
+# egui_kittest snapshot failures
+*.diff.png
+*.new.png
+*.old.png

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=FUIDE Arch-Update Systray Applet
+Comment=Checks for pacman / AUR updates and notifies
+Comment[ja]=pacman / AUR の更新を監視して通知するトレイアプレット
+Icon=fuide-arch-update
+Type=Application
+Exec=/bin/sh -c "sleep 3 && fuide-arch-update-tray"
+Terminal=false
+Categories=System;Utility;
+NoDisplay=true
+X-KDE-autostart-phase=2

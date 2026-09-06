@@ -1,0 +1,26 @@
+[package]
+name = "fuide-arch-update"
+description = "Package manager for Arch Linux (pacman + AUR helper) with a Sci-Fi FUI look, built on egui"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "fuide-arch-update"
+path = "src/main.rs"
+
+[dependencies]
+egui = { workspace = true }
+eframe = { workspace = true }
+fuide = { workspace = true }
+archpkg = { workspace = true }
+chrono = { workspace = true }
+libc = "0.2"
+nix = { version = "0.30", features = ["term", "process", "signal", "fs"] }
+open = "5"
+serde_json = { workspace = true }
+
+[dev-dependencies]
+egui_kittest = { version = "0.36.1", features = ["eframe"] }

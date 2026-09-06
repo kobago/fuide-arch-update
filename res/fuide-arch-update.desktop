@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=FUIDE Arch-Update
+Comment=Package manager for Arch Linux (pacman + AUR) with a Sci-Fi FUI look
+Comment[ja]=Arch Linux 用パッケージマネージャ (pacman + AUR)、SF 風 FUI
+Icon=fuide-arch-update
+Type=Application
+Exec=fuide-arch-update
+Terminal=false
+Categories=System;PackageManager;Utility;
+Keywords=pacman;aur;yay;paru;update;upgrade;package;arch;cachyos;
+StartupWMClass=fuide-arch-update
