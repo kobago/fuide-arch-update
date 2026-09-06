@@ -24,6 +24,7 @@ while [ $# -gt 0 ]; do
 		never|always|auto) ;;
 		--noconfirm) noconfirm=1 ;;
 		--needed) ;;
+		--ask) shift ;;
 		*) args+=("$1") ;;
 	esac
 	shift

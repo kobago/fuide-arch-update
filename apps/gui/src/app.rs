@@ -711,7 +711,7 @@ impl PkgApp {
         let job = if pacman::aur_helper().is_some() {
             self.helper_job("upgrade // all", &["-Syu"])
         } else {
-            self.pacman_job("upgrade // all", &["-Syu", "--noconfirm"])
+            self.pacman_job("upgrade // all", &["-Syu", "--noconfirm", "--ask", "4"])
         };
         match job {
             Ok(job) => self.confirm(Confirm {
@@ -765,9 +765,11 @@ impl PkgApp {
                 let job = if aur {
                     self.helper_job(&format!("install // {name}"), &["-S", &name])
                 } else {
+                    // `--ask 4`: a package that conflicts with the new one is replaced (pacman
+                    // would otherwise answer its own "Remove X?" question with no)
                     self.pacman_job(
                         &format!("install // {name}"),
-                        &["-S", "--needed", "--noconfirm", &name],
+                        &["-S", "--needed", "--noconfirm", "--ask", "4", &name],
                     )
                 };
                 match job {
@@ -777,7 +779,7 @@ impl PkgApp {
                         note: if aur {
                             "BUILT FROM THE AUR WITHOUT REVIEW :: READ THE PKGBUILD FIRST (BUTTON IN THE INSPECTOR)".into()
                         } else {
-                            "DEPENDENCIES ARE INSTALLED AS NEEDED".into()
+                            "DEPENDENCIES ARE INSTALLED AS NEEDED :: A CONFLICTING PACKAGE IS REPLACED".into()
                         },
                         verb: "INSTALL".into(),
                         danger: false,

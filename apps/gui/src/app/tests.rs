@@ -267,11 +267,11 @@ fn install_runs_pacman_through_pkexec_and_streams_its_output() {
     assert!(job.args[0].ends_with("fake-pacman.sh"));
     assert_eq!(
         job.args[1..],
-        ["-S", "--needed", "--noconfirm", "ripgrep-all"]
+        ["-S", "--needed", "--noconfirm", "--ask", "4", "ripgrep-all"]
     );
     assert_eq!(
         job.command_line(),
-        "fake-pkexec.sh fake-pacman.sh -S --needed --noconfirm ripgrep-all"
+        "fake-pkexec.sh fake-pacman.sh -S --needed --noconfirm --ask 4 ripgrep-all"
     );
     confirm_and_run(&ctx, &mut app);
     assert!(std::fs::read_to_string(state.join("fake-authenticated"))
