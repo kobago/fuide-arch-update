@@ -1,9 +1,11 @@
 #!/bin/bash
 # fake-pacman.sh: stands in for `pacman` in tests / screenshots (FUIDE_ARCH_PACMAN).
-# Read-only queries answer from fixture files; mutations print what pacman prints and ask
-# its questions without touching the system. State: $FUIDE_ARCH_STATE_DIR/fake-installed
-# (names removed / added by -Rns / -S) so the inventory reflects what happened.
-#   FAKE_FAIL=1     -S / -Syu fail after the confirmation (exit 1)
+# Read-only queries answer from fixture files; mutations print what pacman prints without
+# touching the system and record what happened under $FUIDE_ARCH_STATE_DIR so the inventory
+# reflects it (fake-removed / fake-added / fake-marked / fake-upgraded).
+# Mutations refuse to run unless FAKE_PKEXEC=1 (set by fake-pkexec.sh), like pacman refusing
+# to run without root.
+#   FAKE_FAIL=1     -S / -Syu fail (exit 1)
 #   FAKE_SLOW=1     pause between steps
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 state="${FUIDE_ARCH_STATE_DIR:-/tmp/fuide-arch-update-fake}"
@@ -13,14 +15,15 @@ added="${state}/fake-added"
 marked="${state}/fake-marked"
 touch "${removed}" "${added}" "${marked}"
 pause() { [ -n "${FAKE_SLOW}" ] && sleep "${1:-0.5}"; return 0; }
-bold="\e[1m"; blue="${bold}\e[34m"; off="\e[0m"
 
-# strip --color never and the like
 args=()
+noconfirm=""
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--color) shift ;;
 		never|always|auto) ;;
+		--noconfirm) noconfirm=1 ;;
+		--needed) ;;
 		*) args+=("$1") ;;
 	esac
 	shift
@@ -29,15 +32,25 @@ set -- "${args[@]}"
 op="$1"; shift
 
 is_removed() { grep -qx "$1" "${removed}"; }
+need_root() {
+	if [ -z "${FAKE_PKEXEC}" ]; then
+		echo "error: you cannot perform this operation unless you are root." >&2
+		exit 1
+	fi
+	# -D never asks; the transaction operations must be told not to
+	[ "$1" = "-D" ] && return 0
+	if [ -z "${noconfirm}" ]; then
+		echo "error: fake pacman needs --noconfirm (there is no terminal to ask on)" >&2
+		exit 1
+	fi
+}
 
 case "${op}" in
 	-Qi)
-		# every block of qi.txt whose Name is not removed
 		awk -v removed="${removed}" '
 			BEGIN { while ((getline l < removed) > 0) gone[l] = 1; RS = ""; ORS = "\n\n" }
 			{ match($0, /Name            : [^\n]*/); name = substr($0, RSTART + 18, RLENGTH - 18); if (!(name in gone)) print $0 }
 		' "${here}/qi.txt"
-		# packages installed through the fake -S
 		while read -r name; do
 			[ -z "${name}" ] && continue
 			is_removed "${name}" && continue
@@ -58,66 +71,51 @@ case "${op}" in
 		;;
 	-Si)
 		for name in "$@"; do
-			printf 'Repository      : extra\nName            : %s\nVersion         : 15.2.0-1\nDescription     : Details for %s from the fake -Si\nURL             : https://example.org/%s\nLicenses        : MIT\nDepends On      : glibc  pcre2\nDownload Size   : 1330.50 KiB\nInstalled Size  : 3654.88 KiB\n\n' "${name}" "${name}" "${name}"
+			printf 'Repository      : extra\nName            : %s\nVersion         : 0.10.6-1\nDescription     : details for %s\nURL             : https://example.org/%s\nLicenses        : AGPL-3.0\nDepends On      : glibc  pcre2\nDownload Size   : 2.00 MiB\nInstalled Size  : 6.00 MiB\n\n' "${name}" "${name}" "${name}"
 		done
 		;;
-	-S|-Syu)
-		pause 1
-		if [ "${op}" = "-Syu" ]; then
-			echo ":: Synchronizing package databases..."
-			printf ' core downloading...\r core is up to date\n'
-			echo ":: Starting full system upgrade..."
-		fi
-		names=()
-		for a in "$@"; do case "$a" in --*) ;; *) names+=("$a") ;; esac; done
+	-S)
+		need_root
 		echo "resolving dependencies..."
-		echo "looking for conflicting packages..."
-		echo
-		printf "Packages (%d) %s\n\n" "${#names[@]}" "${names[*]}"
-		echo "Total Installed Size:  3.57 MiB"
-		echo
-		read -rp ":: Proceed with installation? [Y/n] " answer
-		case "${answer}" in
-			Y|y|"") ;;
-			*) echo "aborted"; exit 1 ;;
-		esac
+		pause
+		echo "Packages (1) $1-1.0-1"
 		if [ -n "${FAKE_FAIL}" ]; then
-			echo "error: failed to commit transaction (conflicting files)"
-			echo "Errors occurred, no packages were upgraded."
+			echo "error: failed to commit transaction (conflicting files)" >&2
 			exit 1
 		fi
-		for n in "${names[@]}"; do
-			printf '(1/1) installing %s\r(1/1) installing %s   [########] 100%%\n' "$n" "$n"
-			grep -qx "$n" "${added}" || echo "$n" >> "${added}"
-			sed -i "/^$n\$/d" "${removed}"
+		echo ":: Processing package changes..."
+		for name in "$@"; do
+			echo "installing ${name}..."
+			echo "${name}" >> "${added}"
 		done
-		[ "${op}" = "-Syu" ] && : > "${state}/fake-upgraded"
-		echo ":: Running post-transaction hooks..."
-		exit 0
 		;;
 	-Rns)
-		names=("$@")
+		need_root
 		echo "checking dependencies..."
-		echo
-		printf "Packages (%d) %s\n\n" "${#names[@]}" "${names[*]}"
-		read -rp ":: Do you want to remove these packages? [Y/n] " answer
-		case "${answer}" in
-			Y|y|"") ;;
-			*) echo "aborted"; exit 1 ;;
-		esac
-		for n in "${names[@]}"; do
-			echo "(1/1) removing $n"
-			echo "$n" >> "${removed}"
+		for name in "$@"; do
+			echo "removing ${name}..."
+			echo "${name}" >> "${removed}"
 		done
-		exit 0
+		;;
+	-Syu)
+		need_root
+		echo ":: Synchronizing package databases..."
+		pause
+		echo ":: Starting full system upgrade..."
+		if [ -n "${FAKE_FAIL}" ]; then
+			echo "error: failed retrieving file 'core.db' from mirror : Could not resolve host" >&2
+			exit 1
+		fi
+		echo "Packages (2) bash-5.3.16-1  ripgrep-15.3.0-1"
+		echo ":: Processing package changes..."
+		touch "${state}/fake-upgraded"
 		;;
 	-D)
+		need_root -D
 		echo "$*" >> "${marked}"
-		echo "${2}: install reason has been set to '${1#--as}'"
-		exit 0
 		;;
 	*)
-		echo "fake-pacman: unhandled ${op} $*" >&2
+		echo "fake pacman: unsupported operation ${op}" >&2
 		exit 1
 		;;
 esac

@@ -1,13 +1,13 @@
 //! FUIDE Arch-Update — pacman / AUR package manager with a tactical-console look.
 //!
-//! Left: views + system readout. Centre: package table above the console pacman runs in.
-//! Right: package inspector + event log. Root commands go through the console (a pty) so
-//! `sudo` and pacman's questions become dialogs.
+//! Left: views + system readout. Centre: package table. Right: package inspector. Bottom:
+//! event log. Commands that change the system run non-interactively through polkit
+//! (`pkexec`, the desktop's own password dialog) and stream their output into the log.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
-use egui::{pos2, vec2, Align2, Key, Rect, RichText, Sense, Stroke, Ui};
+use egui::{pos2, vec2, Align2, Key, Rect, RichText, Sense, Ui};
 use fuide::table::{self, Cell, Column, TableState, Width};
 use fuide::widgets::{self, LogLine};
 use fuide::{
@@ -17,10 +17,7 @@ use fuide::{
 use archpkg::pacman::{self, Package, Reason, SearchHit};
 use archpkg::Upgrade;
 
-use crate::backend::{self, Backend, Msg, SystemInfo};
-use crate::prompt::{self, Prompt};
-use crate::pty::{self, Runner};
-use crate::term::{Hue, Terminal};
+use crate::backend::{self, Backend, Job, Msg, SystemInfo};
 
 pub const APP_ID: &str = "arch-update";
 pub const APP_NAME: &str = "FUIDE Arch-Update";
@@ -29,14 +26,14 @@ const LEFT_W: f32 = 236.0;
 const RIGHT_W: f32 = 340.0;
 const GAP: f32 = 14.0;
 const TOOLBAR_H: f32 = 32.0;
-const CONSOLE_H: f32 = 220.0;
-const CONSOLE_MIN: f32 = 90.0;
-const CONSOLE_CLOSED: f32 = 26.0;
-const TABLE_MIN: f32 = 200.0;
+/// Default log panel height; the divider above it is draggable (`Settings::log_height`).
+const LOG_H: f32 = 170.0;
+const LOG_MIN: f32 = 60.0;
+/// Header strip left when the log panel is collapsed (`Settings::log_open` = false).
+const LOG_CLOSED: f32 = 26.0;
+/// Space kept for the panels above the log when the divider is dragged up.
+const BODY_MIN: f32 = 360.0;
 const VIEWS_H: f32 = 268.0;
-const EVENTS_H: f32 = 170.0;
-const CONSOLE_VISIBLE: usize = 800;
-const PROMPT_QUIET_SECS: f64 = 0.15;
 
 /// Command-line start-up requests (from the tray applet).
 #[derive(Clone, Debug, Default)]
@@ -125,22 +122,6 @@ pub fn status_of(p: &Package) -> Status {
     }
 }
 
-/// A root / helper command to run in the console.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Job {
-    pub label: String,
-    pub program: String,
-    pub args: Vec<String>,
-}
-
-impl Job {
-    pub fn command_line(&self) -> String {
-        format!("{} {}", self.program, self.args.join(" "))
-            .trim_end()
-            .to_string()
-    }
-}
-
 /// A confirmation before running a mutating command.
 pub struct Confirm {
     pub title: String,
@@ -151,21 +132,9 @@ pub struct Confirm {
     pub job: Job,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PromptKey {
-    pub row: usize,
-    pub text: String,
-}
-
 pub enum DialogState {
     Confirm(Confirm),
-    Prompt {
-        prompt: Prompt,
-        key: PromptKey,
-        input: String,
-        selected: Vec<bool>,
-    },
-    Abort,
+    /// Big `ERROR` / `SUCCESS` card; details live in the event log.
     Notice {
         success: bool,
         line: String,
@@ -192,66 +161,17 @@ pub enum Action {
     RemoveOrphans,
     CleanCache,
     Homepage(String),
+    /// Open the package's PKGBUILD on aur.archlinux.org (review before building).
+    Pkgbuild(String),
     CopyName(String),
     Run(Job),
-    Abort,
-    ConfirmAbort,
-    SendLine(String),
-    Answer(String),
-    Dismiss,
     CloseDialog,
     ConfirmDialog,
-    ToggleEnglish,
-    ClearConsole,
     OpenSettings,
-}
-
-/// App options that are not theme settings.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Options {
-    /// Run console commands under `LC_ALL=C.UTF-8` so their prompts are recognised.
-    pub english: bool,
-}
-
-impl Default for Options {
-    fn default() -> Self {
-        Self { english: true }
-    }
-}
-
-impl Options {
-    pub fn path() -> Option<PathBuf> {
-        let p = Settings::path(APP_ID)?;
-        Some(p.with_file_name(format!("{APP_ID}.app.conf")))
-    }
-    pub fn load_from(path: &std::path::Path) -> Self {
-        let mut o = Self::default();
-        if let Ok(text) = std::fs::read_to_string(path) {
-            for line in text.lines() {
-                if let Some((k, v)) = line.split_once('=') {
-                    if k.trim() == "english" {
-                        o.english = v.trim() != "false";
-                    }
-                }
-            }
-        }
-        o
-    }
-    pub fn save_to(&self, path: &std::path::Path) -> std::io::Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(
-            path,
-            format!("# fuide-arch-update options\nenglish={}\n", self.english),
-        )
-    }
 }
 
 pub struct PkgApp {
     pub backend: Backend,
-    pub runner: Runner,
-    pub term: Terminal,
     pub packages: Vec<Package>,
     pub updates: Vec<Upgrade>,
     pub checked_at: Option<u64>,
@@ -261,21 +181,15 @@ pub struct PkgApp {
     pub system: SystemInfo,
     pub view: View,
     pub rows: Vec<usize>,
-    pub table: TableState,
-    pub dirty: bool,
-    pub filter: String,
+    table: TableState,
+    dirty: bool,
+    filter: String,
     pub log: Vec<Event>,
     pub dialog: Option<OpenDialog>,
     notice_queue: VecDeque<(bool, String)>,
-    answered: Option<PromptKey>,
-    last_output_at: f64,
-    console_input: String,
-    console_focus_pending: bool,
     fetch_ms: f32,
     /// Names whose `-Si` details were requested (search results).
     details_requested: std::collections::HashSet<String>,
-    pub options: Options,
-    options_path: Option<PathBuf>,
     start: StartUp,
     devshot: fuide::devshot::DevShot,
     agent: fuide::Agent,
@@ -286,18 +200,15 @@ pub struct PkgApp {
     pub settings: Settings,
     settings_win: SettingsWindow,
     settings_path: Option<PathBuf>,
-    console_h: f32,
+    /// Current log panel height (draggable divider).
+    log_h: f32,
 }
 
 impl PkgApp {
     pub fn new(cc: &eframe::CreationContext<'_>, start: StartUp) -> Self {
         let settings = Settings::load(APP_ID).unwrap_or_else(|| Settings::new(PaletteKind::Cyan));
-        let options = Options::path()
-            .map(|p| Options::load_from(&p))
-            .unwrap_or_default();
-        let mut app = Self::with_context(&cc.egui_ctx, settings, options);
+        let mut app = Self::with_context(&cc.egui_ctx, settings);
         app.settings_path = Settings::path(APP_ID);
-        app.options_path = Options::path();
         app.start = start;
         app.load_saved_check();
         app.backend.fetch_inventory(cc.egui_ctx.clone());
@@ -307,13 +218,11 @@ impl PkgApp {
         app
     }
 
-    pub fn with_context(ctx: &egui::Context, settings: Settings, options: Options) -> Self {
+    pub fn with_context(ctx: &egui::Context, settings: Settings) -> Self {
         theme::install(ctx, settings.palette.palette(), cjk_fallback());
         settings.apply(ctx);
         let mut app = Self {
             backend: Backend::new(),
-            runner: Runner::new(),
-            term: Terminal::new(),
             packages: Vec::new(),
             updates: Vec::new(),
             checked_at: None,
@@ -329,14 +238,8 @@ impl PkgApp {
             log: Vec::new(),
             dialog: None,
             notice_queue: VecDeque::new(),
-            answered: None,
-            last_output_at: 0.0,
-            console_input: String::new(),
-            console_focus_pending: false,
             fetch_ms: 0.0,
             details_requested: Default::default(),
-            options,
-            options_path: None,
             start: StartUp::default(),
             devshot: fuide::devshot::DevShot::from_env(),
             agent: fuide::Agent::new(APP_ID, APP_NAME),
@@ -346,7 +249,7 @@ impl PkgApp {
             dev_close_frame: std::env::var("FUIDE_DEV_DIALOG_CLOSE")
                 .ok()
                 .and_then(|v| v.parse().ok()),
-            console_h: settings.log_height.unwrap_or(CONSOLE_H),
+            log_h: settings.log_height.unwrap_or(LOG_H),
             settings,
             settings_win: SettingsWindow::default(),
             settings_path: None,
@@ -391,8 +294,8 @@ impl PkgApp {
             text: text.into(),
             level,
         });
-        if self.log.len() > 2000 {
-            self.log.drain(..500);
+        if self.log.len() > 3000 {
+            self.log.drain(..1000);
         }
     }
 
@@ -427,7 +330,7 @@ impl PkgApp {
         self.updates.len()
     }
 
-    fn count(&self, v: View) -> usize {
+    pub fn count(&self, v: View) -> usize {
         match v {
             View::Installed => self.packages.len(),
             View::Explicit => self
@@ -493,32 +396,15 @@ impl PkgApp {
         self.dirty = false;
     }
 
-    /// While a confirmation is open and the agent may not confirm, its verb is human-only;
-    /// passwords always are.
+    /// While a confirmation is open and the agent may not confirm, its verb is human-only.
     fn agent_blocked(&self) -> Vec<String> {
-        let mut v = Vec::new();
         match &self.dialog {
             Some(OpenDialog {
                 state: DialogState::Confirm(c),
                 closing: false,
-            }) if !self.settings.agent_confirm => v.push(c.verb.clone()),
-            Some(OpenDialog {
-                state: DialogState::Prompt { prompt, .. },
-                closing: false,
-            }) => {
-                if matches!(prompt, Prompt::Password { .. })
-                    || (prompt.consequential() && !self.settings.agent_confirm)
-                {
-                    v.push(prompt.verb().to_string());
-                }
-            }
-            Some(OpenDialog {
-                state: DialogState::Abort,
-                closing: false,
-            }) if !self.settings.agent_confirm => v.push("ABORT".into()),
-            _ => {}
+            }) if !self.settings.agent_confirm => vec![c.verb.clone()],
+            _ => Vec::new(),
         }
-        v
     }
 
     fn agent_state(&self) -> String {
@@ -549,8 +435,8 @@ impl PkgApp {
             }
             None => s.push_str("selected: none\n"),
         }
-        if let Some(j) = self.runner.job() {
-            let _ = writeln!(s, "running: {}", j.label);
+        if let Some(j) = self.backend.running() {
+            let _ = writeln!(s, "running: {} ({})", j.label, j.command_line());
         }
         if let Some(d) = self.dialog.as_ref().filter(|d| !d.closing) {
             match &d.state {
@@ -564,16 +450,6 @@ impl PkgApp {
                         c.verb
                     );
                 }
-                DialogState::Prompt { prompt, .. } => {
-                    let _ = writeln!(
-                        s,
-                        "dialog: PROMPT {} :: {} :: {}",
-                        prompt.title(),
-                        prompt.text(),
-                        prompt.verb()
-                    );
-                }
-                DialogState::Abort => s.push_str("dialog: ABORT confirmation\n"),
                 DialogState::Notice { success, line } => {
                     let _ = writeln!(
                         s,
@@ -583,13 +459,8 @@ impl PkgApp {
                 }
             }
         }
-        s.push_str("console (latest last):\n");
-        let n = self.term.len();
-        for i in n.saturating_sub(8)..n {
-            let _ = writeln!(s, "  {}", self.term.text(i));
-        }
         s.push_str("log (latest last):\n");
-        let skip = self.log.len().saturating_sub(5);
+        let skip = self.log.len().saturating_sub(8);
         for e in &self.log[skip..] {
             let _ = writeln!(s, "  {} {}", e.time, e.text);
         }
@@ -617,7 +488,7 @@ impl PkgApp {
                                 if orphans > 0 { Level::Warn } else { Level::Ok },
                             );
                             self.packages = pkgs;
-                            self.after_inventory(ctx, t);
+                            self.after_inventory();
                         }
                         Err(e) => self.fail(t, "INVENTORY // PACMAN", &e),
                     }
@@ -678,39 +549,41 @@ impl PkgApp {
                     Err(e) => self.push_log(t, format!("details :: failed :: {e}"), Level::Warn),
                 },
                 Msg::System(info) => self.system = info,
-            }
-        }
-        for msg in self.runner.poll() {
-            match msg {
-                pty::Msg::Output(bytes) => {
-                    self.term.feed(&bytes);
-                    self.last_output_at = t;
+                Msg::Line { text, stderr } => {
+                    let lower = text.to_lowercase();
+                    let level = if lower.starts_with("error") || lower.contains("error:") {
+                        Level::Danger
+                    } else if lower.starts_with("warning") || lower.contains("warning:") {
+                        Level::Warn
+                    } else if text.starts_with("::") || text.starts_with("==>") {
+                        Level::Ok
+                    } else {
+                        let _ = stderr; // makepkg writes progress to stderr; not an error by itself
+                        Level::Info
+                    };
+                    self.push_log(t, text, level);
                 }
-                pty::Msg::Exit {
+                Msg::Exit {
                     label,
+                    ok,
                     code,
-                    signal,
                     elapsed_secs,
-                    ..
                 } => {
-                    self.answered = None;
                     let time = format!("{elapsed_secs:.1} s");
-                    match (code, signal) {
-                        (Some(0), _) => {
-                            self.succeed(t, label.to_uppercase(), &format!("done in {time}"))
-                        }
-                        (_, Some(sig)) => self.push_log(
-                            t,
-                            format!("{label} :: stopped by signal {sig}"),
-                            Level::Warn,
-                        ),
-                        (Some(c), _) => {
-                            self.fail(t, label.to_uppercase(), &format!("exit code {c}"))
-                        }
-                        (None, None) => self.fail(t, label.to_uppercase(), "could not start"),
+                    if ok {
+                        self.succeed(t, label.to_uppercase(), &format!("done in {time}"));
+                    } else {
+                        let detail = match code {
+                            // pkexec: 126 = dismissed, 127 = not authorised
+                            Some(126) => "authentication dismissed".to_string(),
+                            Some(127) => "not authorised (polkit) or command not found".to_string(),
+                            Some(c) => format!("exit code {c}"),
+                            None => "terminated".to_string(),
+                        };
+                        self.fail(t, label.to_uppercase(), &detail);
                     }
-                    // the package database changed: re-read everything and re-check (the
-                    // state file tells the tray)
+                    // the package database may have changed: re-read and re-check (the state
+                    // file tells the tray)
                     self.backend.fetch_inventory(ctx.clone());
                     self.backend.fetch_system(ctx.clone());
                     self.backend.check(ctx.clone());
@@ -720,35 +593,30 @@ impl PkgApp {
     }
 
     /// Start-up requests that need the inventory: `--select`, `--upgrade`.
-    fn after_inventory(&mut self, _ctx: &egui::Context, _t: f64) {
+    fn after_inventory(&mut self) {
         if let Some(name) = self.start.select.take() {
             self.view = View::Updates;
             self.filter.clear();
-            self.rebuild_rows_for_select(&name);
+            self.rebuild_rows();
+            let mut pos = self
+                .rows
+                .iter()
+                .position(|&i| self.packages[i].name == name);
+            if pos.is_none() {
+                self.view = View::Installed;
+                self.rebuild_rows();
+                pos = self
+                    .rows
+                    .iter()
+                    .position(|&i| self.packages[i].name == name);
+            }
+            self.table.selected = pos;
+            self.table.scroll_to_selected = true;
         }
         if self.start.upgrade {
             self.start.upgrade = false;
             self.open_upgrade_all();
         }
-    }
-
-    fn rebuild_rows_for_select(&mut self, name: &str) {
-        self.rebuild_rows();
-        let pos = self
-            .rows
-            .iter()
-            .position(|&i| self.packages[i].name == name);
-        if pos.is_none() {
-            self.view = View::Installed;
-            self.rebuild_rows();
-        }
-        let pos = pos.or_else(|| {
-            self.rows
-                .iter()
-                .position(|&i| self.packages[i].name == name)
-        });
-        self.table.selected = pos;
-        self.table.scroll_to_selected = true;
     }
 
     fn hits_to_packages(&self, hits: Vec<SearchHit>) -> Vec<Package> {
@@ -794,52 +662,6 @@ impl PkgApp {
         }
     }
 
-    pub fn check_prompt(&mut self, now: f64) {
-        if !self.runner.running() || self.dialog.is_some() {
-            return;
-        }
-        let text = self.term.cursor_text();
-        if text.trim().is_empty() || now - self.last_output_at < PROMPT_QUIET_SECS {
-            return;
-        }
-        let key = PromptKey {
-            row: self.term.dropped + self.term.cursor_row(),
-            text: text.clone(),
-        };
-        if self.answered.as_ref() == Some(&key) {
-            return;
-        }
-        let above = self.term.tail(40);
-        let above = &above[..above.len().saturating_sub(1)];
-        let Some(prompt) = prompt::detect(above, &text) else {
-            return;
-        };
-        let n = if let Prompt::Select { items, .. } = &prompt {
-            items.len()
-        } else {
-            0
-        };
-        let input = if let Prompt::Input { default, .. } = &prompt {
-            default.clone()
-        } else {
-            String::new()
-        };
-        self.push_log(
-            now,
-            format!("prompt :: {}", prompt::clean(&text)),
-            Level::Warn,
-        );
-        self.dialog = Some(OpenDialog {
-            state: DialogState::Prompt {
-                prompt,
-                key,
-                input,
-                selected: vec![false; n],
-            },
-            closing: false,
-        });
-    }
-
     fn confirm(&mut self, c: Confirm) {
         self.dialog = Some(OpenDialog {
             state: DialogState::Confirm(c),
@@ -847,12 +669,12 @@ impl PkgApp {
         });
     }
 
-    /// `sudo pacman <args>` (or whatever privilege command is installed).
-    fn root_job(&self, label: &str, args: &[&str]) -> Result<Job, String> {
+    /// `pkexec <program> <args>`: polkit asks for the password in the desktop's own dialog.
+    fn root_job(&self, label: &str, program: PathBuf, args: &[&str]) -> Result<Job, String> {
         let su = pacman::privilege_cmd().ok_or_else(|| {
-            "no privilege elevation command (sudo, sudo-rs, doas, run0)".to_string()
+            "pkexec not found (install polkit and a polkit authentication agent)".to_string()
         })?;
-        let mut full = vec![pacman::pacman_bin().display().to_string()];
+        let mut full = vec![program.display().to_string()];
         full.extend(args.iter().map(|s| s.to_string()));
         Ok(Job {
             label: label.into(),
@@ -861,29 +683,41 @@ impl PkgApp {
         })
     }
 
+    fn pacman_job(&self, label: &str, args: &[&str]) -> Result<Job, String> {
+        self.root_job(label, pacman::pacman_bin(), args)
+    }
+
+    /// `<helper> <args> --noconfirm --sudo pkexec`: the helper runs as the user and asks
+    /// polkit for root when it needs pacman.
     fn helper_job(&self, label: &str, args: &[&str]) -> Result<Job, String> {
         let helper = pacman::aur_helper()
             .ok_or_else(|| "no AUR helper installed (yay, paru, pikaur)".to_string())?;
+        let su = pacman::privilege_cmd().ok_or_else(|| {
+            "pkexec not found (install polkit and a polkit authentication agent)".to_string()
+        })?;
+        let mut full: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        full.push("--noconfirm".into());
+        full.extend(pacman::helper_sudo_args(&helper, &su));
         Ok(Job {
             label: label.into(),
             program: helper.display().to_string(),
-            args: args.iter().map(|s| s.to_string()).collect(),
+            args: full,
         })
     }
 
     fn open_upgrade_all(&mut self) {
         let n = self.updates.len();
         let aur = self.updates.iter().filter(|u| u.aur).count();
-        let job = if aur > 0 || self.system.aur_helper.is_some() && pacman::aur_helper().is_some() {
+        let job = if pacman::aur_helper().is_some() {
             self.helper_job("upgrade // all", &["-Syu"])
         } else {
-            self.root_job("upgrade // all", &["-Syu"])
+            self.pacman_job("upgrade // all", &["-Syu", "--noconfirm"])
         };
         match job {
             Ok(job) => self.confirm(Confirm {
                 title: "Full upgrade".into(),
                 line: format!("{n} packages ({} repo, {aur} aur)", n - aur),
-                note: "SYNCS THE DATABASES AND UPGRADES EVERYTHING :: PARTIAL UPGRADES ARE NOT OFFERED".into(),
+                note: "SYNCS THE DATABASES AND UPGRADES EVERYTHING :: NO QUESTIONS ARE ASKED (--noconfirm)".into(),
                 verb: "UPGRADE ALL".into(),
                 danger: false,
                 job,
@@ -915,17 +749,6 @@ impl PkgApp {
                 self.backend.fetch_system(ctx.clone());
             }
             Action::Check => {
-                if !self.system.checkupdates
-                    && self.fetch_ms > 0.0
-                    && !self.system.kernel.is_empty()
-                {
-                    self.fail(
-                        t,
-                        "CHECK // UPDATES",
-                        "checkupdates not found (install pacman-contrib)",
-                    );
-                    return;
-                }
                 self.push_log(t, "check // checkupdates + aur", Level::Info);
                 self.backend.check(ctx.clone());
             }
@@ -942,15 +765,17 @@ impl PkgApp {
                 let job = if aur {
                     self.helper_job(&format!("install // {name}"), &["-S", &name])
                 } else {
-                    self.root_job(&format!("install // {name}"), &["-S", "--needed", &name])
+                    self.pacman_job(
+                        &format!("install // {name}"),
+                        &["-S", "--needed", "--noconfirm", &name],
+                    )
                 };
                 match job {
                     Ok(job) => self.confirm(Confirm {
                         title: "Install".into(),
                         line: name.clone(),
                         note: if aur {
-                            "BUILT FROM THE AUR WITH THE HELPER :: REVIEW THE PKGBUILD WHEN ASKED"
-                                .into()
+                            "BUILT FROM THE AUR WITHOUT REVIEW :: READ THE PKGBUILD FIRST (BUTTON IN THE INSPECTOR)".into()
                         } else {
                             "DEPENDENCIES ARE INSTALLED AS NEEDED".into()
                         },
@@ -961,25 +786,30 @@ impl PkgApp {
                     Err(e) => self.fail(t, format!("INSTALL // {}", name.to_uppercase()), &e),
                 }
             }
-            Action::Remove(name) => match self
-                .root_job(&format!("remove // {name}"), &["-Rns", &name])
-            {
-                Ok(job) => self.confirm(Confirm {
-                    title: "Remove".into(),
-                    line: name.clone(),
-                    note: "REMOVES THE PACKAGE, ITS CONFIG AND UNNEEDED DEPENDENCIES (-Rns)".into(),
-                    verb: "REMOVE".into(),
-                    danger: true,
-                    job,
-                }),
-                Err(e) => self.fail(t, format!("REMOVE // {}", name.to_uppercase()), &e),
-            },
+            Action::Remove(name) => {
+                match self.pacman_job(
+                    &format!("remove // {name}"),
+                    &["-Rns", "--noconfirm", &name],
+                ) {
+                    Ok(job) => self.confirm(Confirm {
+                        title: "Remove".into(),
+                        line: name.clone(),
+                        note: "REMOVES THE PACKAGE, ITS CONFIG AND UNNEEDED DEPENDENCIES (-Rns)"
+                            .into(),
+                        verb: "REMOVE".into(),
+                        danger: true,
+                        job,
+                    }),
+                    Err(e) => self.fail(t, format!("REMOVE // {}", name.to_uppercase()), &e),
+                }
+            }
             Action::UpgradeAur(name) => {
                 match self.helper_job(&format!("upgrade // {name}"), &["-S", &name]) {
                     Ok(job) => self.confirm(Confirm {
                         title: "Upgrade".into(),
                         line: name.clone(),
-                        note: "REBUILT FROM THE AUR WITH THE HELPER".into(),
+                        note: "REBUILT FROM THE AUR WITHOUT REVIEW :: READ THE PKGBUILD FIRST"
+                            .into(),
                         verb: "UPGRADE".into(),
                         danger: false,
                         job,
@@ -989,7 +819,7 @@ impl PkgApp {
             }
             Action::MarkExplicit(name, explicit) => {
                 let flag = if explicit { "--asexplicit" } else { "--asdeps" };
-                match self.root_job(&format!("mark // {name}"), &["-D", flag, &name]) {
+                match self.pacman_job(&format!("mark // {name}"), &["-D", flag, &name]) {
                     Ok(job) => self.apply(ctx, Action::Run(job), t),
                     Err(e) => self.fail(t, format!("MARK // {}", name.to_uppercase()), &e),
                 }
@@ -1004,9 +834,9 @@ impl PkgApp {
                 if names.is_empty() {
                     return;
                 }
-                let mut args = vec!["-Rns"];
+                let mut args = vec!["-Rns", "--noconfirm"];
                 args.extend(names.iter().map(String::as_str));
-                match self.root_job("remove // orphans", &args) {
+                match self.pacman_job("remove // orphans", &args) {
                     Ok(job) => self.confirm(Confirm {
                         title: "Remove orphans".into(),
                         line: format!("{} packages", names.len()),
@@ -1019,30 +849,23 @@ impl PkgApp {
                 }
             }
             Action::CleanCache => {
-                let su = match pacman::privilege_cmd() {
-                    Some(s) => s,
-                    None => {
-                        self.fail(t, "CLEAN // CACHE", "no privilege elevation command");
-                        return;
-                    }
-                };
-                let job = Job {
-                    label: "clean // cache".into(),
-                    program: su,
-                    args: vec![pacman::paccache_bin().display().to_string(), "-rk2".into()],
-                };
-                self.confirm(Confirm {
-                    title: "Clean cache".into(),
-                    line: self
-                        .system
-                        .cache_kib
-                        .map(|k| format!("{} in /var/cache/pacman/pkg", archpkg::fmt_kib(k).trim()))
-                        .unwrap_or_else(|| "package cache".into()),
-                    note: "KEEPS THE LAST 2 VERSIONS OF EACH PACKAGE (paccache -rk2)".into(),
-                    verb: "CLEAN".into(),
-                    danger: false,
-                    job,
-                });
+                match self.root_job("clean // cache", pacman::paccache_bin(), &["-rk2"]) {
+                    Ok(job) => self.confirm(Confirm {
+                        title: "Clean cache".into(),
+                        line: self
+                            .system
+                            .cache_kib
+                            .map(|k| {
+                                format!("{} in /var/cache/pacman/pkg", archpkg::fmt_kib(k).trim())
+                            })
+                            .unwrap_or_else(|| "package cache".into()),
+                        note: "KEEPS THE LAST 2 VERSIONS OF EACH PACKAGE (paccache -rk2)".into(),
+                        verb: "CLEAN".into(),
+                        danger: false,
+                        job,
+                    }),
+                    Err(e) => self.fail(t, "CLEAN // CACHE", &e),
+                }
             }
             Action::Homepage(url) => {
                 self.push_log(t, format!("open // {url}"), Level::Info);
@@ -1050,75 +873,32 @@ impl PkgApp {
                     self.fail(t, "OPEN // HOMEPAGE", &e.to_string());
                 }
             }
+            Action::Pkgbuild(name) => {
+                let url = format!("https://aur.archlinux.org/cgit/aur.git/tree/PKGBUILD?h={name}");
+                self.apply(ctx, Action::Homepage(url), t);
+            }
             Action::CopyName(name) => {
                 ctx.copy_text(name);
                 self.push_log(t, "name copied to clipboard", Level::Info);
             }
             Action::Run(job) => {
-                if self.runner.running() {
-                    self.fail(
-                        t,
-                        job.label.to_uppercase(),
-                        "another command is still running",
-                    );
-                    return;
-                }
-                self.answered = None;
-                self.last_output_at = t;
-                if !self.term.is_empty() {
-                    self.term.feed(b"\r\n");
-                }
-                self.term
-                    .feed(format!("\x1b[2m$ {}\x1b[0m\r\n", job.command_line()).as_bytes());
-                if self.runner.run_program(
-                    PathBuf::from(&job.program),
-                    job.label.clone(),
-                    job.args.clone(),
-                    self.options.english,
-                    ctx.clone(),
-                ) {
-                    self.push_log(t, format!("$ {}", job.command_line()), Level::Info);
+                let line = job.command_line();
+                let label = job.label.clone();
+                if self.backend.run(job, ctx.clone()) {
+                    self.push_log(t, format!("$ {line}"), Level::Info);
                     self.settings.log_open = true;
-                    self.console_focus_pending = true;
+                } else {
+                    self.fail(t, label.to_uppercase(), "another command is still running");
                 }
             }
-            Action::Abort => {
-                if !self.runner.running() {
-                    return;
-                }
-                self.dialog = Some(OpenDialog {
-                    state: DialogState::Abort,
-                    closing: false,
-                });
-            }
-            Action::ConfirmAbort => {
+            Action::CloseDialog => {
                 if let Some(d) = &mut self.dialog {
                     d.closing = true;
                 }
-                if self.runner.interrupt() {
-                    self.push_log(t, "abort // ctrl+c sent", Level::Warn);
-                } else {
-                    self.runner.terminate();
-                    self.push_log(t, "abort // sigterm sent", Level::Warn);
-                }
             }
-            Action::SendLine(text) => {
-                if !self.runner.running() {
-                    return;
-                }
-                if self.runner.send_line(&text) {
-                    if let Some(d) = &mut self.dialog {
-                        if let DialogState::Prompt { key, .. } = &d.state {
-                            self.answered = Some(key.clone());
-                        }
-                        d.closing = true;
-                    }
-                    self.push_log(t, format!("console // sent {:?}", text), Level::Info);
-                }
-            }
-            Action::Answer(text) => {
+            Action::ConfirmDialog => {
                 let Some(OpenDialog {
-                    state: DialogState::Prompt { key, prompt, .. },
+                    state: DialogState::Confirm(c),
                     closing,
                 }) = &mut self.dialog
                 else {
@@ -1127,90 +907,9 @@ impl PkgApp {
                 if *closing {
                     return;
                 }
-                let secret = matches!(prompt, Prompt::Password { .. });
-                let key = key.clone();
                 *closing = true;
-                if self.runner.send_line(&text) {
-                    self.answered = Some(key);
-                    if secret {
-                        self.push_log(t, "answer // password sent", Level::Info);
-                    } else {
-                        self.push_log(t, format!("answer // {:?}", text), Level::Info);
-                    }
-                } else {
-                    self.fail(t, "ANSWER // SEND", "the process is not reading");
-                }
-            }
-            Action::Dismiss | Action::CloseDialog => {
-                if let Some(d) = &mut self.dialog {
-                    if let DialogState::Prompt { key, .. } = &d.state {
-                        self.answered = Some(key.clone());
-                        self.console_focus_pending = true;
-                    }
-                    d.closing = true;
-                }
-            }
-            Action::ConfirmDialog => {
-                let Some(d) = &self.dialog else { return };
-                if d.closing {
-                    return;
-                }
-                match &d.state {
-                    DialogState::Confirm(c) => {
-                        let job = c.job.clone();
-                        if let Some(d) = &mut self.dialog {
-                            d.closing = true;
-                        }
-                        self.apply(ctx, Action::Run(job), t);
-                    }
-                    DialogState::Abort => self.apply(ctx, Action::ConfirmAbort, t),
-                    DialogState::Notice { .. } => self.apply(ctx, Action::CloseDialog, t),
-                    DialogState::Prompt {
-                        prompt,
-                        input,
-                        selected,
-                        ..
-                    } => {
-                        let text = match prompt {
-                            Prompt::YesNo { .. } => "y".to_string(),
-                            Prompt::Continue { .. } => String::new(),
-                            Prompt::Password { .. } | Prompt::Input { .. } => input.clone(),
-                            Prompt::Select { .. } => selected
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, s)| **s)
-                                .map(|(i, _)| (i + 1).to_string())
-                                .collect::<Vec<_>>()
-                                .join(" "),
-                        };
-                        self.apply(ctx, Action::Answer(text), t);
-                    }
-                }
-            }
-            Action::ToggleEnglish => {
-                self.options.english = !self.options.english;
-                self.push_log(
-                    t,
-                    format!(
-                        "options // console locale {}",
-                        if self.options.english {
-                            "C.UTF-8 (english prompts)"
-                        } else {
-                            "system"
-                        }
-                    ),
-                    Level::Warn,
-                );
-                if let Some(p) = self.options_path.clone() {
-                    if let Err(e) = self.options.save_to(&p) {
-                        self.push_log(t, format!("options // save failed: {e}"), Level::Danger);
-                    }
-                }
-            }
-            Action::ClearConsole => {
-                if !self.runner.running() {
-                    self.term.clear();
-                }
+                let job = c.job.clone();
+                self.apply(ctx, Action::Run(job), t);
             }
             Action::OpenSettings => self.settings_win.open(),
         }
@@ -1265,9 +964,6 @@ impl PkgApp {
             }
             if cmd && i.key_pressed(Key::U) {
                 actions.push(Action::Check);
-            }
-            if cmd && i.key_pressed(Key::L) {
-                actions.push(Action::ClearConsole);
             }
             for (n, key) in [
                 Key::Num1,
@@ -1368,13 +1064,6 @@ impl eframe::App for PkgApp {
         let t = ui.input(|i| i.time);
         let ctx = ui.ctx().clone();
         self.poll(&ctx, t);
-        self.check_prompt(t);
-        if self.runner.running()
-            && !self.term.cursor_text().trim().is_empty()
-            && self.dialog.is_none()
-        {
-            ctx.request_repaint_after(std::time::Duration::from_millis(160));
-        }
         if self.dirty {
             self.rebuild_rows();
         }
@@ -1427,19 +1116,12 @@ impl eframe::App for PkgApp {
                 }
             ))
             .status_left(format!(
-                "{} :: {} ROWS :: {} OUTDATED :: {:.0} FPS :: INVENTORY {:.0} MS{}",
+                "{} :: {} ROWS :: {} OUTDATED :: {:.0} FPS :: INVENTORY {:.0} MS",
                 fuide::fmt::uptime(t),
                 self.rows.len(),
                 outdated,
                 fps,
                 self.fetch_ms,
-                match self.runner.job() {
-                    Some(j) => format!(
-                        " :: RUN {}",
-                        fuide::fmt::uptime(j.started.elapsed().as_secs_f64())
-                    ),
-                    None => String::new(),
-                }
             ))
             .lamp(link_text, link_color, false)
             .settings_button(true);
@@ -1458,21 +1140,12 @@ impl eframe::App for PkgApp {
         if self.backend.searching().is_some() {
             shell = shell.lamp("SEARCHING", pal.warn, true);
         }
-        if let Some(job) = self.runner.job() {
+        if let Some(job) = self.backend.running() {
             shell = shell.lamp(
                 format!("RUNNING {}", job.label.split(" //").next().unwrap_or("")),
                 pal.warn,
                 true,
             );
-        }
-        if matches!(
-            self.dialog,
-            Some(OpenDialog {
-                state: DialogState::Prompt { .. },
-                closing: false
-            })
-        ) {
-            shell = shell.lamp("INPUT WANTED", pal.warn, true);
         }
         if self.system.tray_running {
             shell = shell.lamp("TRAY", pal.accent, false);
@@ -1481,80 +1154,68 @@ impl eframe::App for PkgApp {
             shell = shell.lamp(text, if busy { pal.warn } else { pal.accent }, busy);
         }
 
-        let console_open = self.settings.log_open;
-        let mut console_resized = false;
-        let mut console_toggled = false;
+        let log_open = self.settings.log_open;
+        let mut log_resized = false;
+        let mut log_toggled = false;
         let out = shell.show_full(ui, |ui| {
             let c = ui.max_rect();
             let top = c.top() + 10.0;
-            let left = Rect::from_min_max(pos2(c.left(), top), pos2(c.left() + LEFT_W, c.bottom()));
+            let log_max = c.height() - BODY_MIN;
+            self.log_h = self.log_h.clamp(LOG_MIN, log_max.max(LOG_MIN));
+            let log_h = if log_open { self.log_h } else { LOG_CLOSED };
+            let log_rect = Rect::from_min_max(pos2(c.left(), c.bottom() - log_h), c.max);
+            let body_bottom = log_rect.top() - GAP - 8.0;
+            let left =
+                Rect::from_min_max(pos2(c.left(), top), pos2(c.left() + LEFT_W, body_bottom));
             let right =
-                Rect::from_min_max(pos2(c.right() - RIGHT_W, top), pos2(c.right(), c.bottom()));
+                Rect::from_min_max(pos2(c.right() - RIGHT_W, top), pos2(c.right(), body_bottom));
             let center = Rect::from_min_max(
                 pos2(left.right() + GAP, top),
-                pos2(right.left() - GAP, c.bottom()),
+                pos2(right.left() - GAP, body_bottom),
             );
             let views = Rect::from_min_size(left.min, vec2(left.width(), VIEWS_H));
             let system =
                 Rect::from_min_max(pos2(left.left(), views.bottom() + GAP + 8.0), left.max);
-            let events =
-                Rect::from_min_max(pos2(right.left(), right.bottom() - EVENTS_H), right.max);
-            let inspector =
-                Rect::from_min_max(right.min, pos2(right.right(), events.top() - GAP - 8.0));
-            let console_max = center.height() - TOOLBAR_H - 12.0 - TABLE_MIN;
-            self.console_h = self
-                .console_h
-                .clamp(CONSOLE_MIN, console_max.max(CONSOLE_MIN));
-            let console_h = if console_open {
-                self.console_h
-            } else {
-                CONSOLE_CLOSED
-            };
-            let console =
-                Rect::from_min_max(pos2(center.left(), center.bottom() - console_h), center.max);
             let toolbar = Rect::from_min_size(
                 pos2(center.left(), center.top() - 8.0),
                 vec2(center.width(), TOOLBAR_H),
             );
-            let listing = Rect::from_min_max(
-                pos2(center.left(), toolbar.bottom() + 12.0),
-                pos2(center.right(), console.top() - GAP - 8.0),
-            );
+            let listing =
+                Rect::from_min_max(pos2(center.left(), toolbar.bottom() + 12.0), center.max);
 
             self.ui_views(ui, views, &mut actions);
             self.ui_system(ui, system, &mut actions);
             self.ui_toolbar(ui, toolbar, &mut actions);
             self.ui_listing(ui, listing, &mut actions);
-            self.ui_inspector(ui, inspector, &mut actions);
-            self.ui_events(ui, events);
-            if console_open {
+            self.ui_inspector(ui, right, &mut actions);
+            if log_open {
                 let strip = Rect::from_min_max(
-                    pos2(center.left(), listing.bottom()),
-                    pos2(center.right(), console.top()),
+                    pos2(c.left(), body_bottom),
+                    pos2(c.right(), log_rect.top()),
                 );
                 let resp = widgets::h_splitter(
                     ui,
                     strip,
-                    "console",
-                    &mut self.console_h,
-                    CONSOLE_MIN,
-                    console_max,
-                    "CONSOLE HEIGHT",
+                    "log",
+                    &mut self.log_h,
+                    LOG_MIN,
+                    log_max,
+                    "LOG HEIGHT",
                 );
-                console_resized = resp.drag_stopped();
+                log_resized = resp.drag_stopped();
             }
-            console_toggled = self.ui_console(ui, console, console_open, &mut actions);
+            log_toggled = self.ui_log(ui, log_rect, log_open);
         });
         self.agent.paint(&ctx);
         if out.settings_clicked {
             actions.push(Action::OpenSettings);
         }
-        if console_resized {
-            self.settings.log_height = Some(self.console_h.round());
+        if log_resized {
+            self.settings.log_height = Some(self.log_h.round());
             self.save_settings(t);
         }
-        if console_toggled {
-            self.settings.log_open = !console_open;
+        if log_toggled {
+            self.settings.log_open = !log_open;
             self.save_settings(t);
         }
         self.ui_dialog(&ctx, &mut actions);
@@ -1573,7 +1234,7 @@ impl eframe::App for PkgApp {
 }
 
 impl PkgApp {
-    /// `FUIDE_DEV_DIALOG=install|remove|upgrade|password|error|success|abort`.
+    /// `FUIDE_DEV_DIALOG=install|remove|upgrade|run-upgrade|error|success`.
     fn dev_dialog_state(&mut self, kind: &str, actions: &mut Vec<Action>) {
         actions.push(Action::Select(Some(0)));
         let name = self
@@ -1585,27 +1246,9 @@ impl PkgApp {
             "install" => actions.push(Action::Install(name, false)),
             "remove" => actions.push(Action::Remove(name)),
             "upgrade" => actions.push(Action::UpgradeAll),
-            "password" => {
-                self.dialog = Some(OpenDialog {
-                    state: DialogState::Prompt {
-                        prompt: Prompt::Password {
-                            text: "[sudo] password for kobago:".into(),
-                        },
-                        key: PromptKey {
-                            row: 0,
-                            text: "dev".into(),
-                        },
-                        input: String::new(),
-                        selected: Vec::new(),
-                    },
-                    closing: false,
-                })
-            }
-            "abort" => {
-                self.dialog = Some(OpenDialog {
-                    state: DialogState::Abort,
-                    closing: false,
-                })
+            "run-upgrade" => {
+                actions.push(Action::UpgradeAll);
+                actions.push(Action::ConfirmDialog);
             }
             "error" => self
                 .notice_queue
@@ -1659,7 +1302,7 @@ impl PkgApp {
         } else {
             pal.danger
         };
-        let busy = self.runner.running();
+        let busy = self.backend.running().is_some();
         let size_total: f64 = self
             .packages
             .iter()
@@ -1758,17 +1401,16 @@ impl PkgApp {
                 widgets::readout(
                     ui,
                     "privilege",
-                    &self
-                        .system
+                    self.system
                         .privilege
                         .as_deref()
                         .map(|p| {
                             std::path::Path::new(p)
                                 .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| p.to_string())
+                                .and_then(|n| n.to_str())
+                                .unwrap_or(p)
                         })
-                        .unwrap_or_else(|| "NONE".into()),
+                        .unwrap_or("NONE"),
                     Some(if self.system.privilege.is_some() {
                         pal.text
                     } else {
@@ -1832,7 +1474,7 @@ impl PkgApp {
     fn ui_toolbar(&mut self, ui: &mut Ui, rect: Rect, actions: &mut Vec<Action>) {
         let pal = palette(ui.ctx());
         let ts = type_scale(ui.ctx());
-        let busy = self.runner.running();
+        let busy = self.backend.running().is_some();
         const FILTER_W: f32 = 180.0;
         let left_rect = Rect::from_min_max(
             rect.min,
@@ -2001,11 +1643,9 @@ impl PkgApp {
                             4 => {
                                 let st = status_of(p);
                                 Cell::tag(st.tag()).color(match st {
-                                    Status::Outdated => pal.warn,
-                                    Status::Orphan => pal.warn,
+                                    Status::Outdated | Status::Orphan => pal.warn,
                                     Status::Explicit => pal.ok.gamma_multiply(0.8),
-                                    Status::Dependency => pal.text_dim,
-                                    Status::Available => pal.text_dim,
+                                    Status::Dependency | Status::Available => pal.text_dim,
                                 })
                             }
                             _ => Cell::dim(
@@ -2036,7 +1676,7 @@ impl PkgApp {
     fn ui_inspector(&self, ui: &mut Ui, rect: Rect, actions: &mut Vec<Action>) {
         let pal = palette(ui.ctx());
         let ts = type_scale(ui.ctx());
-        let busy = self.runner.running();
+        let busy = self.backend.running().is_some();
         let sel = self.selected_package();
         let tag = sel.map(|p| p.repo.as_str()).unwrap_or("none").to_string();
         Panel::new("Package").tag(tag, pal.text_dim).show_rect(ui, rect, |ui| {
@@ -2144,7 +1784,14 @@ impl PkgApp {
                     if widgets::button(ui, vec2(72.0, ts.row), "COPY", true).clicked() {
                         actions.push(Action::CopyName(p.name.clone()));
                     }
-                    if p.installed {
+                    if p.is_aur() {
+                        if widgets::button(ui, vec2(96.0, ts.row), "PKGBUILD", true)
+                            .on_hover_text("Open the PKGBUILD on aur.archlinux.org")
+                            .clicked()
+                        {
+                            actions.push(Action::Pkgbuild(p.name.clone()));
+                        }
+                    } else if p.installed {
                         let (label, to) = if p.reason == Reason::Explicit { ("AS DEP", false) } else { ("EXPLICIT", true) };
                         if widgets::button(ui, vec2(96.0, ts.row), label, !busy)
                             .on_hover_text("pacman -D --asexplicit / --asdeps")
@@ -2180,12 +1827,28 @@ impl PkgApp {
         });
     }
 
-    fn ui_events(&self, ui: &mut Ui, rect: Rect) {
+    /// Returns `true` when the title chip was clicked (the caller flips `Settings::log_open`).
+    fn ui_log(&self, ui: &mut Ui, rect: Rect, open: bool) -> bool {
         let pal = palette(ui.ctx());
-        Panel::new("Event log")
-            .tag(format!("{} lines", self.log.len()), pal.text_dim)
+        let ts = type_scale(ui.ctx());
+        let tag = match self.backend.running() {
+            Some(j) => j.command_line(),
+            None => format!("{} lines", self.log.len()),
+        };
+        let (_, toggled) = Panel::new("Event log")
+            .tag(
+                tag,
+                if self.backend.running().is_some() {
+                    pal.warn
+                } else {
+                    pal.text_dim
+                },
+            )
             .padding(8.0, 12.0)
-            .show_rect(ui, rect, |ui| {
+            .show_collapsible_rect(ui, rect, open, |ui| {
+                if !open {
+                    return;
+                }
                 let lines: Vec<LogLine> = self
                     .log
                     .iter()
@@ -2204,103 +1867,9 @@ impl PkgApp {
                     ui,
                     &lines,
                     pal.text_dim,
-                    type_scale(ui.ctx()).small,
+                    ts.label,
                     widgets::LogOrder::NewestFirst,
                 );
-            });
-    }
-
-    fn ui_console(
-        &mut self,
-        ui: &mut Ui,
-        rect: Rect,
-        open: bool,
-        actions: &mut Vec<Action>,
-    ) -> bool {
-        let pal = palette(ui.ctx());
-        let ts = type_scale(ui.ctx());
-        let running = self.runner.running();
-        let tag = match self.runner.job() {
-            Some(j) => j.label.clone(),
-            None => format!("{} lines", self.term.len()),
-        };
-        let input_h = ts.row + 8.0;
-        let (_, toggled) = Panel::new("Console")
-            .tag(tag, if running { pal.warn } else { pal.text_dim })
-            .padding(8.0, 12.0)
-            .show_collapsible_rect(ui, rect, open, |ui| {
-                if !open {
-                    return;
-                }
-                let inner = ui.max_rect();
-                let ch = ui
-                    .painter()
-                    .layout_no_wrap("0".into(), mono(ts.label), pal.text)
-                    .size()
-                    .x
-                    .max(1.0);
-                let cols = ((inner.width() - 12.0) / ch).floor() as u16;
-                let rows = ((inner.height() - input_h) / (ts.label + 4.0)).floor() as u16;
-                self.runner.resize(cols, rows);
-                let out_rect =
-                    Rect::from_min_max(inner.min, pos2(inner.right(), inner.bottom() - input_h));
-                let in_rect = Rect::from_min_max(
-                    pos2(inner.left(), inner.bottom() - input_h + 4.0),
-                    inner.max,
-                );
-                let mut out = ui.new_child(
-                    egui::UiBuilder::new()
-                        .id_salt("console-out")
-                        .max_rect(out_rect),
-                );
-                out.set_clip_rect(out_rect.intersect(ui.clip_rect()));
-                console_lines(&mut out, &self.term, &pal, ts.label);
-                let mut inp = ui.new_child(
-                    egui::UiBuilder::new()
-                        .id_salt("console-in")
-                        .max_rect(in_rect)
-                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                );
-                inp.spacing_mut().item_spacing.x = 6.0;
-                {
-                    let ui = &mut inp;
-                    let btn_w = 4.0 * 52.0 + 3.0 * 6.0 + 6.0 + 84.0;
-                    let w = (ui.available_width() - btn_w).max(80.0);
-                    let hint = if running {
-                        "console input :: enter sends a line"
-                    } else {
-                        "no process :: root commands run here"
-                    };
-                    let resp = widgets::text_input(ui, w, &mut self.console_input, hint);
-                    if self.console_focus_pending && running {
-                        resp.request_focus();
-                        self.console_focus_pending = false;
-                    }
-                    if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                        let text = std::mem::take(&mut self.console_input);
-                        actions.push(Action::SendLine(text));
-                        resp.request_focus();
-                    }
-                    for (label, send) in [("Y", "y"), ("N", "n"), ("ENTER", "")] {
-                        if widgets::button(ui, vec2(52.0, ts.row), label, running).clicked() {
-                            actions.push(Action::SendLine(send.into()));
-                        }
-                    }
-                    let mut english = self.options.english;
-                    if widgets::toggle_chip(ui, "C locale", &mut english)
-                        .on_hover_text(
-                            "Run commands under LC_ALL=C.UTF-8 so their prompts are recognised",
-                        )
-                        .clicked()
-                    {
-                        actions.push(Action::ToggleEnglish);
-                    }
-                    if widgets::button_colored(ui, vec2(52.0, ts.row), "^C", running, pal.danger)
-                        .clicked()
-                    {
-                        actions.push(Action::Abort);
-                    }
-                }
             });
         toggled
     }
@@ -2327,14 +1896,7 @@ impl PkgApp {
                     .width(500.0)
                     .show(ctx, open, |ui| {
                         ui.spacing_mut().item_spacing.y = 4.0;
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(&c.line)
-                                    .font(mono(ts.data + 2.0))
-                                    .color(pal.accent),
-                            )
-                            .wrap(),
-                        );
+                        ui.add(egui::Label::new(RichText::new(&c.line).font(mono(ts.data + 2.0)).color(pal.accent)).wrap());
                         ui.add_space(2.0);
                         ui.add(
                             egui::Label::new(
@@ -2346,234 +1908,10 @@ impl PkgApp {
                         );
                         ui.add_space(6.0);
                         widgets::rule(ui);
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(&c.note).font(mono(ts.label)).color(color),
-                            )
-                            .wrap(),
-                        );
+                        ui.add(egui::Label::new(RichText::new(&c.note).font(mono(ts.label)).color(color)).wrap());
+                        note(ui, "THE DESKTOP ASKS FOR YOUR PASSWORD (POLKIT) :: OUTPUT GOES TO THE EVENT LOG", pal.text_dim);
                         ui.add_space(8.0);
-                        fuide::dialog::button_row(
-                            ui,
-                            &[("CANCEL", pal.text_dim, true), (&c.verb, color, true)],
-                        )
-                    });
-                finished = resp.finished;
-                let clicked = resp.inner.flatten();
-                if !open {
-                } else if resp.should_close || clicked == Some(0) {
-                    actions.push(Action::CloseDialog);
-                } else if enter || clicked == Some(1) {
-                    actions.push(Action::ConfirmDialog);
-                }
-            }
-            DialogState::Prompt {
-                prompt,
-                input,
-                selected,
-                ..
-            } => {
-                let color = if prompt.dangerous() {
-                    pal.danger
-                } else if prompt.consequential() {
-                    pal.warn
-                } else {
-                    pal.accent
-                };
-                let title = prompt.title();
-                let verb = prompt.verb();
-                let is_select = matches!(prompt, Prompt::Select { .. });
-                let resp = Dialog::new(&title)
-                    .tag("console", pal.text_dim)
-                    .outline(color)
-                    .width(if is_select { 560.0 } else { 480.0 })
-                    .show(ctx, open, |ui| {
-                        ui.spacing_mut().item_spacing.y = 4.0;
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(prompt.text())
-                                    .font(mono(ts.data + 1.0))
-                                    .color(pal.accent),
-                            )
-                            .wrap(),
-                        );
-                        ui.add_space(4.0);
-                        let mut clicked: Option<usize> = None;
-                        let mut extra: Option<String> = None;
-                        match prompt {
-                            Prompt::YesNo { default_yes, .. } => {
-                                widgets::rule(ui);
-                                note(
-                                    ui,
-                                    if *default_yes {
-                                        "ENTER = YES  ::  ESC = USE THE CONSOLE LINE"
-                                    } else {
-                                        "ENTER = YES  ::  THE COMMAND'S DEFAULT IS NO"
-                                    },
-                                    color,
-                                );
-                                ui.add_space(8.0);
-                                clicked = fuide::dialog::button_row(
-                                    ui,
-                                    &[("NO", pal.text_dim, true), (verb, color, true)],
-                                );
-                            }
-                            Prompt::Continue { .. } => {
-                                widgets::rule(ui);
-                                ui.add_space(8.0);
-                                clicked = fuide::dialog::button_row(ui, &[(verb, color, true)])
-                                    .map(|_| 1);
-                            }
-                            Prompt::Password { .. } => {
-                                let resp =
-                                    secret_input(ui, ui.available_width(), input, "password");
-                                if !resp.has_focus() && open {
-                                    resp.request_focus();
-                                }
-                                widgets::rule(ui);
-                                note(
-                                    ui,
-                                    "SENT TO THE TERMINAL ONLY :: NEVER STORED OR LOGGED",
-                                    pal.text_dim,
-                                );
-                                ui.add_space(8.0);
-                                clicked = fuide::dialog::button_row(
-                                    ui,
-                                    &[
-                                        ("CANCEL", pal.text_dim, true),
-                                        (verb, color, !input.is_empty()),
-                                    ],
-                                );
-                            }
-                            Prompt::Input { .. } => {
-                                let resp =
-                                    widgets::text_input(ui, ui.available_width(), input, "answer");
-                                if !resp.has_focus() && open {
-                                    resp.request_focus();
-                                }
-                                widgets::rule(ui);
-                                note(ui, "ENTER SENDS THE TEXT (EMPTY = THE DEFAULT)", color);
-                                ui.add_space(8.0);
-                                clicked = fuide::dialog::button_row(
-                                    ui,
-                                    &[("CANCEL", pal.text_dim, true), (verb, color, true)],
-                                );
-                            }
-                            Prompt::Select {
-                                items,
-                                all_label,
-                                enter_label,
-                                ..
-                            } => {
-                                if items.is_empty() {
-                                    let resp = widgets::text_input(
-                                        ui,
-                                        ui.available_width(),
-                                        input,
-                                        "numbers, e.g. 1 3 5 (0 = all)",
-                                    );
-                                    if !resp.has_focus() && open {
-                                        resp.request_focus();
-                                    }
-                                } else {
-                                    let h = (items.len().min(8) as f32) * (ts.row + 2.0) + 4.0;
-                                    egui::ScrollArea::vertical()
-                                        .id_salt("select")
-                                        .max_height(h)
-                                        .min_scrolled_height(h)
-                                        .auto_shrink([false, false])
-                                        .show(ui, |ui| {
-                                            ui.spacing_mut().item_spacing.y = 2.0;
-                                            for (i, item) in items.iter().enumerate() {
-                                                check_row(ui, item, &mut selected[i], pal.accent);
-                                            }
-                                        });
-                                }
-                                widgets::rule(ui);
-                                let n = selected.iter().filter(|s| **s).count();
-                                note(
-                                    ui,
-                                    &format!(
-                                        "{n} SELECTED  ::  {enter_label} = ENTER WITHOUT A CHOICE"
-                                    ),
-                                    color,
-                                );
-                                ui.add_space(8.0);
-                                let sel_enabled = if items.is_empty() {
-                                    !input.is_empty()
-                                } else {
-                                    n > 0
-                                };
-                                let c = fuide::dialog::button_row(
-                                    ui,
-                                    &[
-                                        (enter_label.as_str(), pal.text_dim, true),
-                                        (all_label.as_str(), pal.accent, true),
-                                        (verb, color, sel_enabled),
-                                    ],
-                                );
-                                match c {
-                                    Some(0) => extra = Some(String::new()),
-                                    Some(1) => extra = Some("0".into()),
-                                    Some(2) => {
-                                        if items.is_empty() {
-                                            extra = Some(input.clone())
-                                        } else {
-                                            clicked = Some(1)
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                        (clicked, extra)
-                    });
-                finished = resp.finished;
-                let (clicked, extra) = resp.inner.unwrap_or((None, None));
-                if !open {
-                } else if let Some(text) = extra {
-                    actions.push(Action::Answer(text));
-                } else if resp.should_close {
-                    actions.push(Action::CloseDialog);
-                } else if clicked == Some(0) {
-                    if matches!(prompt, Prompt::YesNo { .. }) {
-                        actions.push(Action::Answer("n".into()));
-                    } else {
-                        actions.push(Action::Dismiss);
-                    }
-                } else if enter || clicked == Some(1) {
-                    actions.push(Action::ConfirmDialog);
-                }
-            }
-            DialogState::Abort => {
-                let resp = Dialog::new("Abort")
-                    .tag("console", pal.text_dim)
-                    .outline(pal.danger)
-                    .width(460.0)
-                    .show(ctx, open, |ui| {
-                        ui.spacing_mut().item_spacing.y = 4.0;
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new("Send Ctrl+C to the running command")
-                                    .font(mono(ts.data + 1.0))
-                                    .color(pal.accent),
-                            )
-                            .wrap(),
-                        );
-                        widgets::rule(ui);
-                        note(
-                            ui,
-                            "STOPPING MID-TRANSACTION CAN LEAVE PACKAGES HALF-INSTALLED",
-                            pal.danger,
-                        );
-                        ui.add_space(8.0);
-                        fuide::dialog::button_row(
-                            ui,
-                            &[
-                                ("KEEP RUNNING", pal.text_dim, true),
-                                ("ABORT", pal.danger, true),
-                            ],
-                        )
+                        fuide::dialog::button_row(ui, &[("CANCEL", pal.text_dim, true), (&c.verb, color, true)])
                     });
                 finished = resp.finished;
                 let clicked = resp.inner.flatten();
@@ -2590,14 +1928,8 @@ impl PkgApp {
                 } else {
                     ("Error", pal.danger)
                 };
-                let resp = fuide::dialog::alert(
-                    ctx,
-                    open,
-                    word,
-                    line,
-                    "details :: console and event log",
-                    color,
-                );
+                let resp =
+                    fuide::dialog::alert(ctx, open, word, line, "details :: event log", color);
                 finished = resp.finished;
                 if open && (resp.should_close || resp.inner == Some(true)) {
                     actions.push(Action::CloseDialog);
@@ -2617,154 +1949,9 @@ fn note(ui: &mut Ui, text: &str, color: egui::Color32) {
         pos2(nr.left() + 2.0, nr.center().y),
         Align2::LEFT_CENTER,
         text,
-        mono(ts.label),
+        mono(ts.small),
         color,
     );
-}
-
-fn check_row(ui: &mut Ui, label: &str, on: &mut bool, accent: egui::Color32) -> egui::Response {
-    let pal = palette(ui.ctx());
-    let ts = type_scale(ui.ctx());
-    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ts.row), Sense::click());
-    if resp.clicked() {
-        *on = !*on;
-    }
-    fuide::agent::describe(&resp, || {
-        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, *on, label.to_string())
-    });
-    let p = ui.painter();
-    if resp.hovered() {
-        p.rect_filled(r, egui::CornerRadius::ZERO, accent.gamma_multiply(0.08));
-    }
-    let bx = Rect::from_center_size(pos2(r.left() + 10.0, r.center().y), vec2(12.0, 12.0));
-    p.rect_stroke(
-        bx,
-        egui::CornerRadius::ZERO,
-        Stroke::new(1.0, accent.gamma_multiply(if *on { 1.0 } else { 0.5 })),
-        egui::StrokeKind::Inside,
-    );
-    if *on {
-        p.rect_filled(bx.shrink(3.0), egui::CornerRadius::ZERO, accent);
-    }
-    p.with_clip_rect(r).text(
-        pos2(r.left() + 24.0, r.center().y),
-        Align2::LEFT_CENTER,
-        label,
-        mono(ts.data),
-        if *on { pal.accent } else { pal.text },
-    );
-    resp
-}
-
-/// Masked password field, never described with its value.
-fn secret_input(ui: &mut Ui, width: f32, text: &mut String, hint: &str) -> egui::Response {
-    let pal = palette(ui.ctx());
-    let ts = type_scale(ui.ctx());
-    let (frame_rect, _) = ui.allocate_exact_size(vec2(width, ts.row), Sense::hover());
-    ui.painter().rect_filled(
-        frame_rect,
-        egui::CornerRadius::ZERO,
-        pal.bg_deep.gamma_multiply(0.6),
-    );
-    let outline_idx = ui.painter().add(egui::Shape::Noop);
-    let inner = frame_rect.shrink2(vec2(6.0, 2.0));
-    let resp = ui.put(
-        inner,
-        egui::TextEdit::singleline(text)
-            .password(true)
-            .frame(egui::Frame::NONE)
-            .font(mono(ts.data))
-            .text_color(pal.accent)
-            .hint_text(
-                RichText::new(hint.to_uppercase())
-                    .font(mono(ts.label))
-                    .color(pal.text_dim),
-            )
-            .desired_width(f32::INFINITY),
-    );
-    let mut info = egui::WidgetInfo::text_edit(true, "", "", hint);
-    info.label = Some(hint.to_uppercase());
-    fuide::agent::describe(&resp, || info);
-    let a = if resp.has_focus() { 0.9 } else { 0.35 };
-    ui.painter().set(
-        outline_idx,
-        egui::Shape::rect_stroke(
-            frame_rect,
-            egui::CornerRadius::ZERO,
-            Stroke::new(1.0, pal.accent.gamma_multiply(a)),
-            egui::StrokeKind::Inside,
-        ),
-    );
-    resp
-}
-
-fn hue_color(style: crate::term::Style, pal: &theme::Palette) -> egui::Color32 {
-    let c = match style.hue {
-        Hue::Default | Hue::White => pal.text,
-        Hue::Red => pal.danger,
-        Hue::Green => pal.ok,
-        Hue::Yellow => pal.warn,
-        Hue::Blue | Hue::Cyan | Hue::Magenta => pal.accent,
-        Hue::Black => pal.text_dim,
-    };
-    if style.dim {
-        pal.text_dim
-    } else if style.bold || style.hue != Hue::Default {
-        c
-    } else {
-        c.gamma_multiply(0.85)
-    }
-}
-
-fn console_lines(ui: &mut Ui, term: &Terminal, pal: &theme::Palette, size: f32) {
-    let total = term.len();
-    let start = total.saturating_sub(CONSOLE_VISIBLE);
-    egui::ScrollArea::vertical()
-        .id_salt("console-scroll")
-        .auto_shrink([false, false])
-        .stick_to_bottom(true)
-        .show(ui, |ui| {
-            ui.spacing_mut().item_spacing = vec2(0.0, 1.0);
-            ui.style_mut().interaction.selectable_labels = true;
-            ui.style_mut().interaction.multi_widget_text_select = true;
-            if start > 0 {
-                ui.add(egui::Label::new(
-                    RichText::new(format!("{start} OLDER LINES NOT SHOWN"))
-                        .font(mono(size))
-                        .color(pal.text_dim),
-                ));
-            }
-            if term.is_empty() {
-                ui.add(egui::Label::new(
-                    RichText::new(
-                        "PACMAN AND THE AUR HELPER RUN HERE :: THEIR PROMPTS BECOME DIALOGS",
-                    )
-                    .font(mono(size))
-                    .color(pal.text_dim),
-                ));
-            }
-            for i in start..total {
-                let runs = term.runs(i);
-                if runs.is_empty() {
-                    ui.add(egui::Label::new(RichText::new(" ").font(mono(size))));
-                    continue;
-                }
-                let mut job = egui::text::LayoutJob::default();
-                job.wrap.max_width = ui.available_width();
-                for r in runs {
-                    job.append(
-                        &r.text,
-                        0.0,
-                        egui::TextFormat {
-                            font_id: mono(size),
-                            color: hue_color(r.style, pal),
-                            ..Default::default()
-                        },
-                    );
-                }
-                ui.add(egui::Label::new(job).wrap());
-            }
-        });
 }
 
 #[cfg(test)]

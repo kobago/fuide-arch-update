@@ -1,8 +1,11 @@
 //! Worker threads around `archpkg`: inventory, update checks, searches and detail lookups run
-//! off the UI thread and come back as [`Msg`]. Mutations are not here — they go through the
-//! console (`pty.rs`) because `sudo` and pacman ask questions.
+//! off the UI thread and come back as [`Msg`]. Mutating commands (`pkexec pacman …`, the AUR
+//! helper) run here too, non-interactively, streaming their output line by line into the
+//! event log; root authentication is polkit's job (the desktop shows its own dialog).
 
 use std::collections::HashMap;
+use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 use archpkg::pacman::{self, Package, SearchHit, Upgrade};
@@ -16,9 +19,39 @@ pub struct SystemInfo {
     pub cache_candidates: Option<u32>,
     pub last_sync: Option<u64>,
     pub aur_helper: Option<String>,
+    /// `pkexec` (or the test override); `None` = no polkit, root commands are refused.
     pub privilege: Option<String>,
     pub checkupdates: bool,
     pub tray_running: bool,
+}
+
+/// A command that changes the system: what to run and how to label it in the log.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Job {
+    pub label: String,
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+impl Job {
+    pub fn command_line(&self) -> String {
+        let prog = std::path::Path::new(&self.program)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.program.clone());
+        let args: Vec<String> = self
+            .args
+            .iter()
+            .map(|a| {
+                std::path::Path::new(a)
+                    .file_name()
+                    .filter(|_| a.starts_with('/'))
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| a.clone())
+            })
+            .collect();
+        format!("{prog} {}", args.join(" ")).trim_end().to_string()
+    }
 }
 
 pub enum Msg {
@@ -26,7 +59,6 @@ pub enum Msg {
     Inventory(Result<Vec<Package>, String>, f32),
     /// `checkupdates` + `<helper> -Qua`; the state file has been rewritten.
     Check(Result<Vec<Upgrade>, String>),
-    /// Repo + AUR search hits for `query`.
     Search {
         query: String,
         result: Result<Vec<SearchHit>, String>,
@@ -34,6 +66,18 @@ pub enum Msg {
     /// `-Si` details for packages that are not installed (search results).
     Details(Result<Vec<Package>, String>),
     System(SystemInfo),
+    /// One line of output from the running job.
+    Line {
+        text: String,
+        stderr: bool,
+    },
+    /// The running job finished.
+    Exit {
+        label: String,
+        ok: bool,
+        code: Option<i32>,
+        elapsed_secs: f32,
+    },
 }
 
 pub struct Backend {
@@ -44,6 +88,7 @@ pub struct Backend {
     searching: Option<String>,
     details_pending: usize,
     system_pending: usize,
+    running: Option<Job>,
 }
 
 impl Default for Backend {
@@ -63,6 +108,7 @@ impl Backend {
             searching: None,
             details_pending: 0,
             system_pending: 0,
+            running: None,
         }
     }
 
@@ -75,6 +121,9 @@ impl Backend {
     pub fn searching(&self) -> Option<&str> {
         self.searching.as_deref()
     }
+    pub fn running(&self) -> Option<&Job> {
+        self.running.as_ref()
+    }
     /// Anything in flight (tests wait on this).
     #[allow(dead_code)]
     pub fn busy(&self) -> bool {
@@ -83,6 +132,7 @@ impl Backend {
             || self.searching.is_some()
             || self.details_pending > 0
             || self.system_pending > 0
+            || self.running.is_some()
     }
 
     #[cfg(test)]
@@ -99,6 +149,8 @@ impl Backend {
                 Msg::Search { .. } => self.searching = None,
                 Msg::Details(_) => self.details_pending = self.details_pending.saturating_sub(1),
                 Msg::System(_) => self.system_pending = self.system_pending.saturating_sub(1),
+                Msg::Line { .. } => {}
+                Msg::Exit { .. } => self.running = None,
             }
             out.push(m);
         }
@@ -154,7 +206,7 @@ impl Backend {
                 let mut hits = pacman::search_repo(&query)?;
                 match pacman::search_aur(&query) {
                     Ok(aur) => hits.extend(aur),
-                    // AUR RPC down: keep the repo hits, the UI shows the error
+                    // AUR RPC down: keep the repo hits
                     Err(e) => {
                         if hits.is_empty() {
                             return Err(e);
@@ -206,7 +258,7 @@ impl Backend {
                 }),
                 privilege: pacman::privilege_cmd(),
                 checkupdates: pacman::has_checkupdates(),
-                tray_running: std::process::Command::new("pgrep")
+                tray_running: Command::new("pgrep")
                     .args(["-x", "fuide-arch-update-tray"])
                     .output()
                     .is_ok_and(|o| !o.stdout.is_empty()),
@@ -215,6 +267,120 @@ impl Backend {
             ctx.request_repaint();
         });
     }
+
+    /// Run a mutating command, streaming its output. Returns false if one is already running.
+    /// Non-interactive: stdin is `/dev/null`, `LC_ALL=C.UTF-8`, colours off.
+    pub fn run(&mut self, job: Job, ctx: egui::Context) -> bool {
+        if self.running.is_some() {
+            return false;
+        }
+        self.running = Some(job.clone());
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
+            let child = Command::new(&job.program)
+                .args(&job.args)
+                .env("LC_ALL", "C.UTF-8")
+                .env_remove("LANGUAGE")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn();
+            let mut child = match child {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(Msg::Line {
+                        text: format!("cannot start {}: {e}", job.program),
+                        stderr: true,
+                    });
+                    let _ = tx.send(Msg::Exit {
+                        label: job.label,
+                        ok: false,
+                        code: None,
+                        elapsed_secs: 0.0,
+                    });
+                    ctx.request_repaint();
+                    return;
+                }
+            };
+            let mut readers = Vec::new();
+            for (stream, is_err) in [
+                (
+                    child
+                        .stdout
+                        .take()
+                        .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+                    false,
+                ),
+                (
+                    child
+                        .stderr
+                        .take()
+                        .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+                    true,
+                ),
+            ] {
+                let Some(stream) = stream else { continue };
+                let tx = tx.clone();
+                let ctx = ctx.clone();
+                readers.push(std::thread::spawn(move || {
+                    for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                        // progress lines end with \r; keep the last state of the line
+                        let text = strip_ansi(line.rsplit('\r').next().unwrap_or(&line))
+                            .trim_end()
+                            .to_string();
+                        if text.is_empty() {
+                            continue;
+                        }
+                        let _ = tx.send(Msg::Line {
+                            text,
+                            stderr: is_err,
+                        });
+                        ctx.request_repaint();
+                    }
+                }));
+            }
+            let status = child.wait();
+            for r in readers {
+                let _ = r.join();
+            }
+            let (ok, code) = match status {
+                Ok(s) => (s.success(), s.code()),
+                Err(_) => (false, None),
+            };
+            let _ = tx.send(Msg::Exit {
+                label: job.label,
+                ok,
+                code,
+                elapsed_secs: t0.elapsed().as_secs_f32(),
+            });
+            ctx.request_repaint();
+        });
+        true
+    }
+}
+
+/// Drop `ESC [ … <letter>` sequences (makepkg and friends colour their output regardless).
+pub fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for c in chars.by_ref() {
+                    if ('\x40'..='\x7e').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if c != '\x07' {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Merge a check result into the inventory: set `latest` on the installed packages.
@@ -228,4 +394,30 @@ pub fn apply_updates(packages: &mut [Package], updates: &[Upgrade]) {
 /// The saved check (start-up, before the first live check).
 pub fn saved_check() -> CheckState {
     state::load()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_colour_and_bell() {
+        assert_eq!(strip_ansi("\x1b[1;34m==>\x1b[0m done\x07"), "==> done");
+        assert_eq!(strip_ansi("plain"), "plain");
+    }
+
+    #[test]
+    fn command_line_shows_file_names() {
+        let j = Job {
+            label: "x".into(),
+            program: "/usr/bin/pkexec".into(),
+            args: vec![
+                "/usr/bin/pacman".into(),
+                "-S".into(),
+                "--noconfirm".into(),
+                "rg".into(),
+            ],
+        };
+        assert_eq!(j.command_line(), "pkexec pacman -S --noconfirm rg");
+    }
 }

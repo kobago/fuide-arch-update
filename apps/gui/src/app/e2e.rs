@@ -18,8 +18,7 @@ fn harness() -> Harness<'static, PkgApp> {
         .with_size(Vec2::new(1320.0, 840.0))
         .with_step_dt(1.0 / 60.0)
         .build_eframe(|cc| {
-            let mut app =
-                PkgApp::with_context(&cc.egui_ctx, Settings::default(), Options::default());
+            let mut app = PkgApp::with_context(&cc.egui_ctx, Settings::default());
             app.backend.fetch_inventory(cc.egui_ctx.clone());
             app.backend.fetch_system(cc.egui_ctx.clone());
             app.backend.check(cc.egui_ctx.clone());
@@ -34,7 +33,7 @@ fn pump(h: &mut Harness<'static, PkgApp>) {
     loop {
         h.run_steps(1);
         let s = h.state();
-        if !s.backend.busy() && !s.runner.running() && !s.dirty {
+        if !s.backend.busy() && !s.dirty {
             break;
         }
         assert!(Instant::now() < deadline, "worker did not finish");
@@ -64,46 +63,7 @@ fn wait_enabled(h: &mut Harness<'static, PkgApp>, label: &str) {
         {
             return;
         }
-        assert!(
-            Instant::now() < deadline,
-            "no enabled {label}; dialog: {}; console:\n{}",
-            match &h.state().dialog {
-                None => "none".to_string(),
-                Some(OpenDialog { state, closing }) => format!(
-                    "{} (closing {closing})",
-                    match state {
-                        DialogState::Confirm(_) => "confirm",
-                        DialogState::Prompt { prompt, .. } => prompt.verb(),
-                        DialogState::Abort => "abort",
-                        DialogState::Notice { .. } => "notice",
-                    }
-                ),
-            },
-            (0..h.state().term.len())
-                .map(|i| h.state().term.text(i))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
-}
-
-/// Run frames until a prompt dialog whose verb is `verb` is open and past its fade-in.
-fn wait_dialog(h: &mut Harness<'static, PkgApp>, verb: &str) {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        h.run_steps(1);
-        if let Some(OpenDialog {
-            state: DialogState::Prompt { prompt, .. },
-            closing: false,
-        }) = &h.state().dialog
-        {
-            if prompt.verb() == verb {
-                h.run_steps(12);
-                return;
-            }
-        }
-        assert!(Instant::now() < deadline, "no {verb} prompt");
+        assert!(Instant::now() < deadline, "no enabled {label}");
         std::thread::sleep(Duration::from_millis(5));
     }
 }
@@ -125,7 +85,7 @@ fn shell_and_views_are_in_the_tree() {
         "CLOSE WINDOW",
         "SETTINGS",
         "REFRESH",
-        "CONSOLE",
+        "EVENT LOG",
         "CHECK",
     ] {
         assert!(h.query_all_by_label(label).count() > 0, "{label} missing");
@@ -154,43 +114,37 @@ fn selecting_a_row_shows_the_inspector_and_remove_asks_first() {
             closing: false
         })
     ));
-    // CANCEL closes it without running anything
     wait_enabled(&mut h, "CANCEL");
     h.get_by_role_and_label(Role::Button, "CANCEL").click();
     h.run_steps(12);
     assert!(h.state().dialog.is_none());
-    assert!(!h.state().runner.running());
+    assert!(h.state().backend.running().is_none());
 }
 
 #[test]
-fn upgrade_all_through_the_dialogs() {
+fn upgrade_all_runs_to_the_success_card() {
     let _guard = serial();
     let mut h = harness();
     h.get_by_role_and_label(Role::Button, "UPGRADE ALL  3")
         .click();
     h.run_steps(2);
-    wait_enabled(&mut h, "UPGRADE ALL");
-    // the dialog's verb is the only enabled "UPGRADE ALL" button besides the toolbar's;
-    // Enter confirms the dialog
+    wait_enabled(&mut h, "CANCEL");
+    // Enter confirms the dialog; the command streams into the log and ends in a card
     h.key_press(Key::Enter);
-    h.run_steps(12);
-    assert!(h.state().runner.running());
-    // yay's diffs question → INPUT dialog: Enter sends the default (empty)
-    wait_enabled(&mut h, "SEND");
-    h.key_press(Key::Enter);
-    h.run_steps(12);
-    wait_dialog(&mut h, "AUTHENTICATE");
-    h.event(egui::Event::Text("pw".into()));
-    h.run_steps(2);
-    wait_enabled(&mut h, "AUTHENTICATE");
-    h.key_press(Key::Enter);
-    h.run_steps(12);
-    wait_enabled(&mut h, "INSTALL");
-    h.key_press(Key::Enter);
-    h.run_steps(12);
+    h.run_steps(3);
+    assert!(h.state().backend.running().is_some());
     pump(&mut h);
     assert!(log_has(&h, "UPGRADE // ALL :: done"));
+    assert!(log_has(&h, ":: Starting full system upgrade..."));
+    assert!(matches!(
+        h.state().dialog,
+        Some(OpenDialog {
+            state: DialogState::Notice { success: true, .. },
+            ..
+        })
+    ));
     dismiss_cards(&mut h);
+    assert_eq!(h.state().outdated_count(), 0);
 }
 
 #[test]

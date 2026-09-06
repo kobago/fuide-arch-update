@@ -4,9 +4,6 @@
 
 mod app;
 mod backend;
-mod prompt;
-mod pty;
-mod term;
 
 fn main() -> eframe::Result {
     // `fuide-arch-update --mcp`: stdio MCP bridge to the running app (see `fuide::agent::bridge`)

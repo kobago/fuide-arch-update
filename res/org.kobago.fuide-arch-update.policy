@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+  FUIDE Arch-Update runs pacman / paccache through `pkexec`. Without this file polkit uses
+  pkexec's generic action and asks for the password on every command; with it (installed to
+  /usr/share/polkit-1/actions) the authorisation is kept for a few minutes, so a full upgrade
+  followed by an orphan clean-up asks once.
+-->
+<policyconfig>
+  <vendor>FUIDE Arch-Update</vendor>
+  <vendor_url>https://github.com/kobago/fuide-arch-update</vendor_url>
+
+  <action id="org.kobago.fuide-arch-update.pacman">
+    <description>Manage packages with pacman</description>
+    <description xml:lang="ja">pacman でパッケージを管理する</description>
+    <message>Authentication is required to install, remove or upgrade packages</message>
+    <message xml:lang="ja">パッケージのインストール・削除・更新には認証が必要です</message>
+    <defaults>
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/pacman</annotate>
+  </action>
+
+  <action id="org.kobago.fuide-arch-update.paccache">
+    <description>Clean the package cache</description>
+    <description xml:lang="ja">パッケージキャッシュを掃除する</description>
+    <message>Authentication is required to clean the package cache</message>
+    <message xml:lang="ja">パッケージキャッシュの掃除には認証が必要です</message>
+    <defaults>
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/paccache</annotate>
+  </action>
+</policyconfig>

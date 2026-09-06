@@ -1,7 +1,8 @@
 //! pacman / AUR helper queries and output parsing.
 //!
 //! Executables can be overridden for tests: `FUIDE_ARCH_PACMAN`, `FUIDE_ARCH_CHECKUPDATES`,
-//! `FUIDE_ARCH_AUR_HELPER` (a path; `none` disables AUR support), `FUIDE_ARCH_PACCACHE`.
+//! `FUIDE_ARCH_AUR_HELPER` (a path; `none` disables AUR support), `FUIDE_ARCH_PACCACHE`,
+//! `FUIDE_ARCH_PKEXEC`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -134,16 +135,28 @@ pub fn aur_helper() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// `sudo`, `sudo-rs`, `doas` or `run0`: what prefixes root commands in the console.
+/// `pkexec` (polkit: the desktop shows its own password dialog). `FUIDE_ARCH_PKEXEC`
+/// overrides it (tests; `none` disables root commands).
 pub fn privilege_cmd() -> Option<String> {
-    if let Some(v) = std::env::var_os("FUIDE_ARCH_SUDO") {
+    if let Some(v) = std::env::var_os("FUIDE_ARCH_PKEXEC") {
         let v = v.to_string_lossy().into_owned();
         return (v != "none" && !v.is_empty()).then_some(v);
     }
-    ["sudo", "sudo-rs", "doas", "run0"]
-        .iter()
-        .find(|c| on_path(c))
-        .map(|c| c.to_string())
+    on_path("pkexec").then(|| "pkexec".to_string())
+}
+
+/// How an AUR helper is told to use `privilege` instead of `sudo`: yay and paru take
+/// `--sudo <cmd>`; other helpers get nothing (they will use their own default).
+pub fn helper_sudo_args(helper: &Path, privilege: &str) -> Vec<String> {
+    let name = helper
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if name.contains("yay") || name.contains("paru") {
+        vec!["--sudo".into(), privilege.into()]
+    } else {
+        Vec::new()
+    }
 }
 
 pub fn has_checkupdates() -> bool {
@@ -681,6 +694,19 @@ extra/ripgrep 15.2.0-1
         assert_eq!(u[0].name, "linux-cachyos");
         assert_eq!(u[1].new, "13.0.1-1");
         assert!(u[1].aur);
+    }
+
+    #[test]
+    fn helper_sudo_flag() {
+        assert_eq!(
+            helper_sudo_args(Path::new("/usr/bin/yay"), "pkexec"),
+            vec!["--sudo", "pkexec"]
+        );
+        assert_eq!(
+            helper_sudo_args(Path::new("paru"), "pkexec"),
+            vec!["--sudo", "pkexec"]
+        );
+        assert!(helper_sudo_args(Path::new("pikaur"), "pkexec").is_empty());
     }
 
     #[test]
