@@ -2,7 +2,7 @@ PREFIX ?= /usr/local
 gui = fuide-arch-update
 tray = fuide-arch-update-tray
 
-.PHONY: build test install uninstall clean enable-tray disable-tray
+.PHONY: build test install uninstall clean
 
 build:
 	# Build the GUI and the systray applet
@@ -30,10 +30,3 @@ uninstall:
 
 clean:
 	rm -rf target/
-
-# Per-user: start the tray applet with the desktop session (XDG autostart).
-enable-tray:
-	install -Dm 644 "res/${tray}.desktop" "$${XDG_CONFIG_HOME:-$${HOME}/.config}/autostart/${tray}.desktop"
-
-disable-tray:
-	rm -f "$${XDG_CONFIG_HOME:-$${HOME}/.config}/autostart/${tray}.desktop"

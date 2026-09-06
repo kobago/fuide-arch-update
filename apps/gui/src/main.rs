@@ -4,18 +4,24 @@
 
 mod app;
 mod backend;
+mod instance;
+mod setup;
 
 fn main() -> eframe::Result {
     // `fuide-arch-update --mcp`: stdio MCP bridge to the running app (see `fuide::agent::bridge`)
     if std::env::args().nth(1).as_deref() == Some("--mcp") {
         std::process::exit(fuide::agent::bridge::run(app::APP_ID, app::APP_NAME));
     }
-    if std::env::args()
-        .nth(1)
-        .is_some_and(|a| a == "--version" || a == "-V")
-    {
-        println!("fuide-arch-update {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
+    match std::env::args().nth(1).as_deref() {
+        Some("--version" | "-V") => {
+            println!("fuide-arch-update {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        // Per-user desktop integration (start menu, icon, tray at login) for a `cargo install`
+        // copy: see `setup.rs`.
+        Some("--setup") => std::process::exit(setup::setup()),
+        Some("--unsetup") => std::process::exit(setup::unsetup()),
+        _ => {}
     }
     // `--upgrade` (tray: "Upgrade now"): open with the full-upgrade confirmation up.
     // `--select NAME` (tray: a package entry): open the Updates view on that package.
@@ -28,6 +34,14 @@ fn main() -> eframe::Result {
             _ => {}
         }
     }
+    // One window per session: a second launch hands its request to the running one and exits.
+    let guard = match instance::claim(
+        &instance::runtime_dir(),
+        &instance::Request::from_start(&start),
+    ) {
+        instance::Claim::Primary(g) => g,
+        instance::Claim::Forwarded => return Ok(()),
+    };
     fuide::devshot::install_trace_logger();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -43,6 +57,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         app::APP_NAME,
         options,
-        Box::new(move |cc| Ok(Box::new(app::PkgApp::new(cc, start)))),
+        Box::new(move |cc| Ok(Box::new(app::PkgApp::new(cc, start, guard)))),
     )
 }

@@ -57,16 +57,40 @@ fuide-arch-update-tray [--interval SECS] [--no-initial-check]   # 既定 3600 �
 - 状態ファイル `~/.local/state/fuide-arch-update/check` を GUI と共有 (両方が書く。トレイは変更を監視して即反映)
 - アイコンはコードで描く ARGB ピクスマップ (アイコンテーマ不要)。同じ図形が `res/fuide-arch-update.svg`
 - 1 セッション 1 インスタンス (`$XDG_RUNTIME_DIR` のロック)
+- GUI も 1 セッション 1 窓: 起動済みならトレイのクリックや 2 回目の起動は既存の窓を前面に出す (要求は `$XDG_RUNTIME_DIR/fuide-arch-update.sock` 経由。`--select` / `--upgrade` もそちらに渡る)
 
 ## ビルドと導入
 
+### cargo install (root 不要)
+
 ```sh
 sudo pacman -S --needed cargo pacman-contrib polkit    # checkupdates / paccache、pkexec (KDE / GNOME には認証エージェントが入っている)
-make && sudo make install PREFIX=/usr                  # /usr/bin/fuide-arch-update{,-tray} + .desktop + アイコン + polkit ポリシー
-make enable-tray                                       # 任意 (root 不要): ログイン時にトレイを自動起動 (~/.config/autostart)
+export CARGO_NET_GIT_FETCH_WITH_CLI=true               # fuide は ssh の非公開リポジトリ: システムの git で取得 (~/.cargo/config.toml の [net] でも可)
+cargo install --git ssh://git@github.com/kobago/fuide-arch-update.git fuide-arch-update fuide-arch-update-tray
+fuide-arch-update --setup                              # スタートメニュー + アイコン + ログイン時のトレイ自動起動、トレイを今すぐ起動
 ```
 
-`pkg/PKGBUILD` (`fuide-arch-update-git`) もあります (`cd pkg && makepkg -si`)。
+手元の checkout から入れるなら、ルートは仮想マニフェストなので `--path .` ではなくクレートごとに指定します (この場合はリポジトリ内の `.cargo/config.toml` が効くので環境変数は不要):
+
+```sh
+cargo install --path apps/gui && cargo install --path apps/tray
+fuide-arch-update --setup
+```
+
+`--setup` は `~/.local/share/applications` / `~/.local/share/icons` / `~/.config/autostart` に、自分のバイナリの絶対パスを書いた `.desktop` を置きます (`~/.cargo/bin` がセッションの PATH に無くても動く)。`fuide-arch-update --unsetup` で元に戻ります。polkit のポリシーだけはシステム側にしか置けないので、この形では root 操作のたびにパスワードを聞かれます。気になるなら 1 ファイルだけ入れます:
+
+```sh
+sudo install -Dm644 res/org.kobago.fuide-arch-update.policy /usr/share/polkit-1/actions/
+```
+
+### システムワイド (make / PKGBUILD)
+
+```sh
+make && sudo make install PREFIX=/usr                  # /usr/bin/fuide-arch-update{,-tray} + .desktop + アイコン + polkit ポリシー
+fuide-arch-update --setup                              # 任意: ログイン時にトレイを自動起動 (ユーザーごと)
+```
+
+`pkg/PKGBUILD` (`fuide-arch-update-git`) もあります (`cd pkg && makepkg -si`)。Makefile はビルドではなく、バイナリ以外 (.desktop、アイコン、polkit ポリシー) を `DESTDIR` / `PREFIX` に置くための PKGBUILD 用の薄い層です。
 
 `fuide` クレートは非公開リポジトリから ssh で取得します (`Cargo.toml` の git 依存 + `.cargo/config.toml` の `git-fetch-with-cli`)。手元の checkout を使うなら `~/.cargo/config.toml` に:
 
