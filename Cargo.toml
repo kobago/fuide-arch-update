@@ -14,7 +14,7 @@ repository = "https://github.com/kobago/fuide-arch-update"
 [workspace.dependencies]
 egui = "0.36.1"
 eframe = { version = "0.36.1", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
-fuide = { git = "ssh://git@github.com/kobago/fuide.git", branch = "main" }
+fuide = { git = "https://github.com/kobago/fuide.git", branch = "main" }
 archpkg = { path = "crates/archpkg" }
 chrono = "0.4"
 serde_json = "1"

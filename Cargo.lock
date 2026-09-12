@@ -1238,7 +1238,7 @@ dependencies = [
 [[package]]
 name = "fuide"
 version = "0.1.0"
-source = "git+ssh://git@github.com/kobago/fuide.git?branch=main#451fe521c0e46806eafd1c72266a4ebc5540192a"
+source = "git+https://github.com/kobago/fuide.git?branch=main#2f47493619dae0a26ff9ac6261ed8720e873457c"
 dependencies = [
  "egui",
  "log",

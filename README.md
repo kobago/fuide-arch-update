@@ -66,7 +66,7 @@ fuide-arch-update-tray [--interval SECS] [--no-initial-check]   # 既定 3600 �
 ```sh
 sudo pacman -S --needed cargo pacman-contrib polkit    # checkupdates / paccache、pkexec (KDE / GNOME には認証エージェントが入っている)
 export CARGO_NET_GIT_FETCH_WITH_CLI=true               # fuide は ssh の非公開リポジトリ: システムの git で取得 (~/.cargo/config.toml の [net] でも可)
-cargo install --git ssh://git@github.com/kobago/fuide-arch-update.git fuide-arch-update fuide-arch-update-tray
+cargo install --git https://github.com/kobago/fuide-arch-update.git fuide-arch-update fuide-arch-update-tray
 fuide-arch-update --setup                              # スタートメニュー + アイコン + ログイン時のトレイ自動起動、トレイを今すぐ起動
 ```
 
@@ -95,7 +95,7 @@ fuide-arch-update --setup                              # 任意: ログイン時
 `fuide` クレートは非公開リポジトリから ssh で取得します (`Cargo.toml` の git 依存 + `.cargo/config.toml` の `git-fetch-with-cli`)。手元の checkout を使うなら `~/.cargo/config.toml` に:
 
 ```toml
-[patch."ssh://git@github.com/kobago/fuide.git"]
+[patch."https://github.com/kobago/fuide.git"]
 fuide = { path = "/home/you/projects/github.com/kobago/fuide/crates/fuide" }
 ```
 
