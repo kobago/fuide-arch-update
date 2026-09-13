@@ -17,6 +17,7 @@ pub struct SystemInfo {
     pub reboot_required: bool,
     pub cache_kib: Option<f64>,
     pub cache_candidates: Option<u32>,
+    pub cache_uninstalled: Option<u32>,
     pub last_sync: Option<u64>,
     pub aur_helper: Option<String>,
     /// `pkexec` (or the test override); `None` = no polkit, root commands are refused.
@@ -250,6 +251,7 @@ impl Backend {
                 reboot_required,
                 cache_kib: pacman::cache_size_kib(),
                 cache_candidates: pacman::cache_candidates(2),
+                cache_uninstalled: pacman::cache_uninstalled_candidates(),
                 last_sync: pacman::last_sync_epoch(),
                 aur_helper: pacman::aur_helper().map(|p| {
                     p.file_name()

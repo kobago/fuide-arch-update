@@ -890,7 +890,9 @@ impl PkgApp {
                 }
             }
             Action::CleanCache => {
-                match self.root_job("clean // cache", pacman::paccache_bin(), &["-rk2"]) {
+                let (program, args) = pacman::clean_cache_command();
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                match self.root_job("clean // cache", program, &args) {
                     Ok(job) => self.confirm(Confirm {
                         title: "Clean cache".into(),
                         line: self
@@ -900,7 +902,10 @@ impl PkgApp {
                                 format!("{} in /var/cache/pacman/pkg", archpkg::fmt_kib(k).trim())
                             })
                             .unwrap_or_else(|| "package cache".into()),
-                        note: "KEEPS THE LAST 2 VERSIONS OF EACH PACKAGE (paccache -rk2)".into(),
+                        note:
+                            "KEEPS THE LAST 2 VERSIONS OF EACH INSTALLED PACKAGE (paccache -rk2), \
+                               DROPS EVERY VERSION OF UNINSTALLED ONES (paccache -ruk0)"
+                                .into(),
                         verb: "CLEAN".into(),
                         danger: false,
                         job,
@@ -1382,7 +1387,7 @@ impl PkgApp {
                     ui,
                     "cache",
                     &format!(
-                        "{}{}",
+                        "{}{}{}",
                         self.system
                             .cache_kib
                             .map(|k| archpkg::fmt_kib(k).trim().to_string())
@@ -1391,6 +1396,11 @@ impl PkgApp {
                             .cache_candidates
                             .filter(|c| *c > 0)
                             .map(|c| format!(" :: {c} OLD"))
+                            .unwrap_or_default(),
+                        self.system
+                            .cache_uninstalled
+                            .filter(|c| *c > 0)
+                            .map(|c| format!(" :: {c} UNINSTALLED"))
                             .unwrap_or_default()
                     ),
                     None,

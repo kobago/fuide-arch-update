@@ -461,7 +461,11 @@ fn orphans_and_cache_confirmations() {
     app.apply(&ctx, Action::CleanCache, 2.0);
     let job = confirm_job(&app);
     assert!(job.program.ends_with("fake-pkexec.sh"));
-    assert_eq!(job.args[1..], ["-rk2"]);
+    // both paccache passes under one polkit prompt: sh -c '"$0" -rk2 && "$0" -ruk0' <paccache>
+    assert_eq!(job.args[0], "sh");
+    assert_eq!(job.args[1], "-c");
+    assert_eq!(job.args[2], r#""$0" -rk2 && "$0" -ruk0"#);
+    assert_eq!(job.args[3], "none");
 }
 
 #[test]
