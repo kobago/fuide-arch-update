@@ -368,6 +368,7 @@ async fn run_check(handle: &Handle<Tray>) {
 }
 
 /// Desktop notification with "Open" / "Upgrade now" actions (waits on its own thread).
+/// Auto-dismisses after 10 s so it does not pile up in the notification tray.
 fn notify(count: usize, fresh: &[String], gui: PathBuf) {
     let body = {
         let mut names = fresh.iter().take(6).cloned().collect::<Vec<_>>().join(", ");
@@ -389,7 +390,7 @@ fn notify(count: usize, fresh: &[String], gui: PathBuf) {
             .icon("system-software-update")
             .action("open", "Open")
             .action("upgrade", "Upgrade now")
-            .timeout(notify_rust::Timeout::Never)
+            .timeout(notify_rust::Timeout::Milliseconds(10_000))
             .show();
         match shown {
             Ok(h) => h.wait_for_action(|action| match action {
