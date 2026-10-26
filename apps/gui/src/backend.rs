@@ -32,6 +32,9 @@ pub struct Job {
     pub label: String,
     pub program: String,
     pub args: Vec<String>,
+    /// More argument lists for `program`, each run only if the previous one succeeded
+    /// (`pkexec paccache …` twice: one polkit action, so `auth_admin_keep` covers both).
+    pub then: Vec<Vec<String>>,
 }
 
 impl Job {
@@ -40,18 +43,27 @@ impl Job {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| self.program.clone());
-        let args: Vec<String> = self
-            .args
-            .iter()
-            .map(|a| {
-                std::path::Path::new(a)
-                    .file_name()
-                    .filter(|_| a.starts_with('/'))
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| a.clone())
+        self.steps()
+            .map(|args| {
+                let args: Vec<String> = args
+                    .iter()
+                    .map(|a| {
+                        std::path::Path::new(a)
+                            .file_name()
+                            .filter(|_| a.starts_with('/'))
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| a.clone())
+                    })
+                    .collect();
+                format!("{prog} {}", args.join(" ")).trim_end().to_string()
             })
-            .collect();
-        format!("{prog} {}", args.join(" ")).trim_end().to_string()
+            .collect::<Vec<_>>()
+            .join(" && ")
+    }
+
+    /// `args`, then each of `then`.
+    pub fn steps(&self) -> impl Iterator<Item = &Vec<String>> {
+        std::iter::once(&self.args).chain(&self.then)
     }
 }
 
@@ -280,76 +292,14 @@ impl Backend {
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             let t0 = std::time::Instant::now();
-            let child = Command::new(&job.program)
-                .args(&job.args)
-                .env("LC_ALL", "C.UTF-8")
-                .env_remove("LANGUAGE")
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn();
-            let mut child = match child {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = tx.send(Msg::Line {
-                        text: format!("cannot start {}: {e}", job.program),
-                        stderr: true,
-                    });
-                    let _ = tx.send(Msg::Exit {
-                        label: job.label,
-                        ok: false,
-                        code: None,
-                        elapsed_secs: 0.0,
-                    });
-                    ctx.request_repaint();
-                    return;
+            let mut result = (true, Some(0));
+            for args in job.steps() {
+                result = run_step(&job.program, args, &tx, &ctx);
+                if !result.0 {
+                    break;
                 }
-            };
-            let mut readers = Vec::new();
-            for (stream, is_err) in [
-                (
-                    child
-                        .stdout
-                        .take()
-                        .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
-                    false,
-                ),
-                (
-                    child
-                        .stderr
-                        .take()
-                        .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
-                    true,
-                ),
-            ] {
-                let Some(stream) = stream else { continue };
-                let tx = tx.clone();
-                let ctx = ctx.clone();
-                readers.push(std::thread::spawn(move || {
-                    for line in BufReader::new(stream).lines().map_while(Result::ok) {
-                        // progress lines end with \r; keep the last state of the line
-                        let text = strip_ansi(line.rsplit('\r').next().unwrap_or(&line))
-                            .trim_end()
-                            .to_string();
-                        if text.is_empty() {
-                            continue;
-                        }
-                        let _ = tx.send(Msg::Line {
-                            text,
-                            stderr: is_err,
-                        });
-                        ctx.request_repaint();
-                    }
-                }));
             }
-            let status = child.wait();
-            for r in readers {
-                let _ = r.join();
-            }
-            let (ok, code) = match status {
-                Ok(s) => (s.success(), s.code()),
-                Err(_) => (false, None),
-            };
+            let (ok, code) = result;
             let _ = tx.send(Msg::Exit {
                 label: job.label,
                 ok,
@@ -359,6 +309,78 @@ impl Backend {
             ctx.request_repaint();
         });
         true
+    }
+}
+
+/// Run `program args`, streaming its output as [`Msg::Line`]; (success, exit code).
+fn run_step(
+    program: &str,
+    args: &[String],
+    tx: &Sender<Msg>,
+    ctx: &egui::Context,
+) -> (bool, Option<i32>) {
+    let child = Command::new(program)
+        .args(args)
+        .env("LC_ALL", "C.UTF-8")
+        .env_remove("LANGUAGE")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.send(Msg::Line {
+                text: format!("cannot start {program}: {e}"),
+                stderr: true,
+            });
+            return (false, None);
+        }
+    };
+    let mut readers = Vec::new();
+    for (stream, is_err) in [
+        (
+            child
+                .stdout
+                .take()
+                .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+            false,
+        ),
+        (
+            child
+                .stderr
+                .take()
+                .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+            true,
+        ),
+    ] {
+        let Some(stream) = stream else { continue };
+        let tx = tx.clone();
+        let ctx = ctx.clone();
+        readers.push(std::thread::spawn(move || {
+            for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                // progress lines end with \r; keep the last state of the line
+                let text = strip_ansi(line.rsplit('\r').next().unwrap_or(&line))
+                    .trim_end()
+                    .to_string();
+                if text.is_empty() {
+                    continue;
+                }
+                let _ = tx.send(Msg::Line {
+                    text,
+                    stderr: is_err,
+                });
+                ctx.request_repaint();
+            }
+        }));
+    }
+    let status = child.wait();
+    for r in readers {
+        let _ = r.join();
+    }
+    match status {
+        Ok(s) => (s.success(), s.code()),
+        Err(_) => (false, None),
     }
 }
 
@@ -419,7 +441,11 @@ mod tests {
                 "--noconfirm".into(),
                 "rg".into(),
             ],
+            then: vec![vec!["/usr/bin/paccache".into(), "-rk2".into()]],
         };
-        assert_eq!(j.command_line(), "pkexec pacman -S --noconfirm rg");
+        assert_eq!(
+            j.command_line(),
+            "pkexec pacman -S --noconfirm rg && pkexec paccache -rk2"
+        );
     }
 }

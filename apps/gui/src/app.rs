@@ -719,6 +719,7 @@ impl PkgApp {
             label: label.into(),
             program: su,
             args: full,
+            then: Vec::new(),
         })
     }
 
@@ -741,6 +742,7 @@ impl PkgApp {
             label: label.into(),
             program: helper.display().to_string(),
             args: full,
+            then: Vec::new(),
         })
     }
 
@@ -890,9 +892,19 @@ impl PkgApp {
                 }
             }
             Action::CleanCache => {
-                let (program, args) = pacman::clean_cache_command();
-                let args: Vec<&str> = args.iter().map(String::as_str).collect();
-                match self.root_job("clean // cache", program, &args) {
+                // one `pkexec paccache` per pass (not `pkexec sh -c`): the polkit policy
+                // matches paccache itself, so its auth_admin_keep asks once for both
+                let [first, rest @ ..] = pacman::CLEAN_CACHE_PASSES;
+                let job = self
+                    .root_job("clean // cache", pacman::paccache_bin(), &[first])
+                    .map(|mut job| {
+                        job.then = rest
+                            .iter()
+                            .map(|pass| vec![job.args[0].clone(), pass.to_string()])
+                            .collect();
+                        job
+                    });
+                match job {
                     Ok(job) => self.confirm(Confirm {
                         title: "Clean cache".into(),
                         line: self

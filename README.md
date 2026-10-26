@@ -30,7 +30,7 @@ pkg/PKGBUILD      fuide-arch-update-git
 ## 画面
 
 - **VIEWS** — INSTALLED / EXPLICIT / UPDATES / AUR / ORPHANS / SEARCH (Ctrl+1..6)。更新と孤立には注意色の点
-- **SYSTEM** — 最新率ゲージ、パッケージ数 / 明示 / AUR / 更新、インストール容量、キャッシュ容量 (`paccache -dk2` / `-duk0` の候補数)、孤立、DB 同期時刻、最終チェック、カーネル、AUR ヘルパー、権限昇格 (`pkexec`)、トレイ稼働。`CLEAN CACHE` (`paccache -rk2` + `-ruk0`: 古い版とアンインストール済みのキャッシュを 1 回の認証で削除)、`ORPHANS n` (`pacman -Rns`)
+- **SYSTEM** — 最新率ゲージ、パッケージ数 / 明示 / AUR / 更新、インストール容量、キャッシュ容量 (`paccache -dk2` / `-duk0` の候補数)、孤立、DB 同期時刻、最終チェック、カーネル、AUR ヘルパー、権限昇格 (`pkexec`)、トレイ稼働。`CLEAN CACHE` (`paccache -rk2` + `-ruk0`: 古い版とアンインストール済みのキャッシュを削除。polkit ポリシーがあれば認証は 1 回)、`ORPHANS n` (`pacman -Rns`)
 - **ツールバー** — 再読込 (Ctrl+R)、`CHECK` (Ctrl+U: `checkupdates` + `-Qua`、状態ファイルに書く → トレイに反映)、`UPGRADE ALL n`、フィルター (Ctrl+F)。SEARCH ビューでは検索欄 + `SEARCH` (`pacman -Ss` + `yay -Ss --aur`。同名はリポジトリ優先、インストール済みは在庫の情報をそのまま表示、未導入のものは選択時に `-Si` で詳細を取得)
 - **一覧** — NAME / VERSION / LATEST / REPO / STATUS (OUTDATED / ORPHAN / EXPLICIT / DEP / AVAILABLE) / SIZE。列見出しでソート、ダブルクリックでホームページ
 - **PACKAGE** — 説明、状態、版 / 最新、repo、容量、導入日、ビルド日、ライセンス、グループ、パッケージャ / メンテナ、AUR の票数 / 人気 / out-of-date、DEPENDS / REQUIRED BY / OPTIONAL / PROVIDES / CONFLICTS。`HOMEPAGE` / `COPY` / `PKGBUILD` (AUR) / `EXPLICIT` ↔ `AS DEP` (`pacman -D`)、`UPGRADE` (AUR) / `UPGRADE ALL` / `REMOVE` (`-Rns`、危険色) / `INSTALL` (`-S --needed` または `yay -S`)

@@ -355,24 +355,9 @@ pub fn cache_uninstalled_candidates() -> Option<u32> {
     paccache_candidates("-duk0")
 }
 
-/// The pruning passes `clean_cache_command` runs, in order: keep the last 2 versions of each
-/// installed package, then drop every version of the uninstalled ones.
+/// The pruning passes of CLEAN CACHE, one `pkexec paccache` each, in order: keep the last 2
+/// versions of each installed package, then drop every version of the uninstalled ones.
 pub const CLEAN_CACHE_PASSES: [&str; 2] = ["-rk2", "-ruk0"];
-
-/// `sh -c '<paccache> -rk2 && <paccache> -ruk0'` as (program, args), so both passes run
-/// under one privilege prompt. The paccache path travels as `$0`, never through the shell's
-/// quoting.
-pub fn clean_cache_command() -> (PathBuf, Vec<String>) {
-    let script = CLEAN_CACHE_PASSES
-        .iter()
-        .map(|pass| format!("\"$0\" {pass}"))
-        .collect::<Vec<_>>()
-        .join(" && ");
-    (
-        PathBuf::from("sh"),
-        vec!["-c".into(), script, paccache_bin().display().to_string()],
-    )
-}
 
 /// Candidate count from a `paccache -d…` dry run (`… finished dry run: N candidates …`).
 fn paccache_candidates(flags: &str) -> Option<u32> {
